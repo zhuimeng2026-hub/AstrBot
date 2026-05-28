@@ -206,8 +206,10 @@ class Prpcrypt:
             print(e)
             return ierror.WXBizMsgCrypt_IllegalBuffer, None
         if from_receiveid != receiveid:
-            print("receiveid not match", receiveid, from_receiveid)
-            return ierror.WXBizMsgCrypt_ValidateCorpid_Error, None
+            logger = logging.getLogger("astrbot")
+            logger.warning("receiveid not match (got=%r, expected=%r), allowing for compatibility", from_receiveid, receiveid)
+            # 微信客服(WeChat Customer Service)的 receiveid 与企业微信智能机器人不同，
+            # 此处不阻断校验以保证兼容性（SHA1 签名校验已通过）。
         return 0, json_content
 
     def get_random_str(self):

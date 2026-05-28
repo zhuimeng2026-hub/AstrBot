@@ -5,6 +5,7 @@
 import base64
 import hashlib
 import json
+import xml.etree.ElementTree as ET
 from typing import Any
 
 import aiohttp
@@ -51,6 +52,18 @@ class WecomAIBotAPIClient:
 
         """
         try:
+            # 微信客服回调消息体是 XML 格式，WXBizJsonMsgCrypt 需要 {"encrypt": "..."} JSON 格式
+            post_str = encrypted_data.decode("utf-8")
+            if post_str.strip().startswith("<"):
+                try:
+                    root = ET.fromstring(post_str)
+                    encrypt_elem = root.find("Encrypt")
+                    if encrypt_elem is not None and encrypt_elem.text:
+                        post_str = json.dumps({"encrypt": encrypt_elem.text})
+                        encrypted_data = post_str.encode("utf-8")
+                except ET.ParseError:
+                    logger.warning("消息体 XML 解析失败，尝试作为 JSON 处理")
+
             ret, decrypted_msg = self.wxcpt.DecryptMsg(
                 encrypted_data,
                 msg_signature,
@@ -68,9 +81,22 @@ class WecomAIBotAPIClient:
                     message_data = json.loads(decrypted_msg)
                     logger.debug(f"解密成功，消息内容: {message_data}")
                     return WecomAIBotConstants.SUCCESS, message_data
-                except json.JSONDecodeError as e:
-                    logger.error(f"JSON 解析失败: {e}, 原始消息: {decrypted_msg}")
-                    return WecomAIBotConstants.PARSE_XML_ERROR, None
+                except json.JSONDecodeError:
+                    # 微信客服回调解密后是 XML 格式，尝试解析
+                    try:
+                        root = ET.fromstring(decrypted_msg.strip())
+                        message_data = {}
+                        for child in root:
+                            key = child.tag.lower() if child.tag else child.tag
+                            if child.text:
+                                message_data[key] = child.text.strip()
+                            else:
+                                message_data[key] = ""
+                        logger.debug(f"从 XML 解析到消息: {message_data}")
+                        return WecomAIBotConstants.SUCCESS, message_data
+                    except ET.ParseError as e2:
+                        logger.error(f"XML 解析也失败: {e2}, 原始消息: {decrypted_msg}")
+                        return WecomAIBotConstants.PARSE_XML_ERROR, None
             else:
                 logger.error("解密消息为空")
                 return WecomAIBotConstants.DECRYPT_ERROR, None

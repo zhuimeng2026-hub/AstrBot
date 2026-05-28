@@ -28,6 +28,7 @@ class WecomAIBotMessageEvent(AstrMessageEvent):
         webhook_client: WecomAIBotWebhookClient | None = None,
         only_use_webhook_url_to_send: bool = False,
         long_connection_sender: (Callable[[str, dict], Awaitable[bool]] | None) = None,
+        kf_sender: (Callable[[MessageChain], Awaitable[None]] | None) = None,
     ) -> None:
         """初始化消息事件
 
@@ -37,6 +38,7 @@ class WecomAIBotMessageEvent(AstrMessageEvent):
             platform_meta: 平台元数据
             session_id: 会话 ID
             api_client: API 客户端
+            kf_sender: 微信客服发送函数
 
         """
         super().__init__(message_str, message_obj, platform_meta, session_id)
@@ -45,6 +47,7 @@ class WecomAIBotMessageEvent(AstrMessageEvent):
         self.webhook_client = webhook_client
         self.only_use_webhook_url_to_send = only_use_webhook_url_to_send
         self.long_connection_sender = long_connection_sender
+        self._kf_sender = kf_sender
 
     async def _mark_stream_complete(self, stream_id: str) -> None:
         back_queue = self.queue_mgr.get_or_create_back_queue(stream_id)
@@ -195,6 +198,16 @@ class WecomAIBotMessageEvent(AstrMessageEvent):
                 unsupported_only=True,
             )
 
+        # 微信客服消息：直接通过 KF API 发送，跳过 stream 队列
+        if self._kf_sender and message:
+            logger.debug("[KF] event.send() calling kf_sender")
+            try:
+                await self._kf_sender(message)
+            except Exception as e:
+                logger.error(f"微信客服发送失败: {e}")
+            await super().send(MessageChain([]))
+            return
+
         await WecomAIBotMessageEvent._send(
             message,
             stream_id,
@@ -217,6 +230,21 @@ class WecomAIBotMessageEvent(AstrMessageEvent):
         )
         req_id = pending_response.get("callback_params", {}).get("req_id")
         back_queue = self.queue_mgr.get_or_create_back_queue(stream_id)
+
+        # 微信客服消息：累积所有文本，最后通过 KF API 一次性发送
+        if self._kf_sender:
+            merged_chain = MessageChain([])
+            async for chain in generator:
+                merged_chain.chain.extend(chain.chain)
+            merged_chain.squash_plain()
+            if merged_chain.chain:
+                logger.debug("[KF] send_streaming() calling kf_sender with merged chain")
+                try:
+                    await self._kf_sender(merged_chain)
+                except Exception as e:
+                    logger.error(f"微信客服流式发送失败: {e}")
+            await super().send_streaming(generator, use_fallback)
+            return
 
         if (
             connection_mode == "long_connection"

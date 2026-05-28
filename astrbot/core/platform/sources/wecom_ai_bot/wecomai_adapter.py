@@ -6,10 +6,13 @@
 import asyncio
 import base64
 import hashlib
+import json
 import time
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
+
+import aiohttp
 
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
@@ -170,6 +173,14 @@ class WecomAIBotAdapter(Platform):
                 )
             except WecomAIBotWebhookError as e:
                 logger.error("企业微信消息推送 webhook 配置无效: %s", e)
+
+        # 微信客服最新会话信息
+        self._last_open_kfid: str = ""
+        self._last_external_userid: str = ""
+        self._kf_msg_cursor: str = ""  # kf/sync_msg 翻页游标
+        self._kf_processed_msgids: set[str] = set()  # 已处理消息 ID，用于去重
+        self._kf_sync_lock = asyncio.Lock()  # 防止并发拉取消息
+        self._kf_last_sync_time: int = int(time.time())  # 上次同步时间戳，初始化为当前时间
 
     async def _handle_queued_message(self, data: dict) -> None:
         """处理队列中的消息，类似webchat的callback"""
@@ -341,6 +352,11 @@ class WecomAIBotAdapter(Platform):
             return None
         elif msgtype == "event":
             event = message_data.get("event")
+            if event == "kf_msg_or_event":
+                # 微信客服事件通知：有新的客服消息需要拉取
+                logger.info("收到微信客服消息事件通知，开始拉取消息...")
+                asyncio.create_task(self._sync_kf_messages())
+                return None
             if event == "enter_chat" and self.friend_message_welcome_text:
                 # 用户进入会话，发送欢迎消息
                 try:
@@ -566,10 +582,29 @@ class WecomAIBotAdapter(Platform):
         session: MessageSesion,
         message_chain: MessageChain,
     ) -> None:
-        """通过消息推送 webhook 发送消息。"""
+        """通过微信客服 API 或 webhook 发送消息。"""
+        # 尝试通过微信客服 API 发送
+        logger.debug(f"[KF] send_by_session called, open_kfid={self._last_open_kfid!r}, ext_userid={self._last_external_userid!r}")
+        if self._last_open_kfid and self._last_external_userid:
+            try:
+                await self._send_kf_message(
+                    self._last_open_kfid,
+                    self._last_external_userid,
+                    message_chain,
+                )
+                await super().send_by_session(session, message_chain)
+                return
+            except Exception as e:
+                logger.error(
+                    "微信客服 API 发送失败(session=%s): %s",
+                    session.session_id,
+                    e,
+                )
+
+        # fallback: webhook
         if not self.webhook_client:
             logger.warning(
-                "主动消息发送失败: 未配置企业微信消息推送 Webhook URL，请前往配置添加。session_id=%s",
+                "主动消息发送失败: 未配置企业微信消息推送 Webhook URL。session_id=%s",
                 session.session_id,
             )
             await super().send_by_session(session, message_chain)
@@ -584,6 +619,271 @@ class WecomAIBotAdapter(Platform):
                 e,
             )
         await super().send_by_session(session, message_chain)
+
+    async def _send_kf_message(
+        self, open_kfid: str, external_userid: str, message_chain: MessageChain
+    ) -> None:
+        """通过微信客服 API 发送消息"""
+        corpid = self.config.get("corpid", "")
+        corpsecret = self.config.get("corpsecret", "")
+        if not corpid or not corpsecret:
+            raise RuntimeError("corpid/corpsecret 未配置")
+
+        async with aiohttp.ClientSession() as session:
+            # 获取 access_token
+            async with session.get(
+                "https://qyapi.weixin.qq.com/cgi-bin/gettoken",
+                params={"corpid": corpid, "corpsecret": corpsecret},
+            ) as resp:
+                token_data = await resp.json()
+                if token_data.get("errcode", -1) != 0:
+                    raise RuntimeError(
+                        f"获取 access_token 失败: {token_data.get('errmsg')}"
+                    )
+                access_token = token_data["access_token"]
+
+            # 遍历 message_chain 发送
+            sent_any = False
+            for comp in message_chain.chain:
+                if isinstance(comp, Plain):
+                    if not comp.text or not comp.text.strip():
+                        continue
+                    payload = {
+                        "touser": external_userid,
+                        "open_kfid": open_kfid,
+                        "msgtype": "text",
+                        "text": {"content": comp.text},
+                    }
+                elif isinstance(comp, Image):
+                    media_id = getattr(comp, "media_id", None) or ""
+                    if not media_id:
+                        logger.warning("微信客服图片发送跳过: 缺少 media_id")
+                        continue
+                    payload = {
+                        "touser": external_userid,
+                        "open_kfid": open_kfid,
+                        "msgtype": "image",
+                        "image": {"media_id": media_id},
+                    }
+                else:
+                    logger.debug("微信客服发送跳过不支持的组件类型: %s", type(comp).__name__)
+                    continue
+
+                sent_any = True
+                async with session.post(
+                    "https://qyapi.weixin.qq.com/cgi-bin/kf/send_msg",
+                    params={"access_token": access_token},
+                    json=payload,
+                ) as resp:
+                    result = await resp.json()
+                    errcode = result.get("errcode", -1)
+                    if errcode != 0:
+                        logger.error(
+                            "微信客服发送消息失败: errcode=%s errmsg=%s",
+                            errcode,
+                            result.get("errmsg"),
+                        )
+                    else:
+                        logger.info(
+                            "微信客服消息发送成功: touser=%s msgtype=%s",
+                            external_userid,
+                            payload.get("msgtype"),
+                        )
+
+            if not sent_any:
+                logger.warning(
+                    "微信客服发送消息跳过: message_chain 中无可发送的组件"
+                )
+
+    async def _sync_kf_messages(self) -> None:
+        """拉取微信客服消息并处理。"""
+        if self._kf_sync_lock.locked():
+            logger.debug("微信客服消息拉取正在进行中，跳过")
+            return
+        async with self._kf_sync_lock:
+            await self._sync_kf_messages_inner()
+
+    async def _sync_kf_messages_inner(self) -> None:
+        """实际拉取微信客服消息。"""
+        corpid = self.config.get("corpid", "")
+        corpsecret = self.config.get("corpsecret", "")
+        if not corpid or not corpsecret:
+            logger.error("微信客服消息拉取失败: 未配置 corpid/corpsecret")
+            return
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                # 1. 获取 access_token
+                token_url = "https://qyapi.weixin.qq.com/cgi-bin/gettoken"
+                async with session.get(
+                    token_url,
+                    params={"corpid": corpid, "corpsecret": corpsecret},
+                ) as resp:
+                    token_data = await resp.json()
+                    if token_data.get("errcode", -1) != 0:
+                        logger.error(
+                            "获取 access_token 失败: %s", token_data.get("errmsg")
+                        )
+                        return
+                    access_token = token_data["access_token"]
+
+                # 2. 拉取消息（使用 cursor 翻页，避免重复拉取）
+                sync_url = "https://qyapi.weixin.qq.com/cgi-bin/kf/sync_msg"
+                payload: dict = {"limit": 100}
+                if self._kf_msg_cursor:
+                    payload["cursor"] = self._kf_msg_cursor
+
+                logger.debug(
+                    "拉取微信客服消息: cursor=%r",
+                    self._kf_msg_cursor or "(empty)",
+                )
+
+                async with session.post(
+                    sync_url,
+                    params={"access_token": access_token},
+                    json=payload,
+                ) as resp:
+                    sync_data = await resp.json()
+                    if sync_data.get("errcode", -1) != 0:
+                        logger.error(
+                            "同步微信客服消息失败: errcode=%s errmsg=%s",
+                            sync_data.get("errcode"),
+                            sync_data.get("errmsg"),
+                        )
+                        return
+
+                    # 更新 cursor 以便下次从断点拉取
+                    next_cursor = sync_data.get("next_cursor", "")
+                    has_more = sync_data.get("has_more", False)
+                    if next_cursor:
+                        self._kf_msg_cursor = next_cursor
+                        logger.debug("更新 cursor: %s (has_more=%s)", next_cursor, has_more)
+
+                    msg_list = sync_data.get("msg_list", [])
+                    if not msg_list:
+                        logger.debug("没有新的微信客服消息")
+                        return
+
+                    # 过滤：只处理用户发的消息（排除机器人自己的回复）
+                    # 且只处理上次同步之后的新消息
+                    new_user_msgs = []
+                    for msg in msg_list:
+                        msgtype = msg.get("msgtype", "")
+                        if msgtype not in ("text", "image", "miniprogram"):
+                            continue
+                        send_time = msg.get("send_time", 0)
+                        if send_time <= self._kf_last_sync_time:
+                            continue
+                        new_user_msgs.append(msg)
+
+                    logger.info(
+                        "拉取到 %d 条微信客服消息，其中 %d 条新用户消息",
+                        len(msg_list),
+                        len(new_user_msgs),
+                    )
+
+                    if not new_user_msgs:
+                        return
+
+                    # 更新同步时间戳（使用最新消息的时间）
+                    latest_time = max(m.get("send_time", 0) for m in new_user_msgs)
+                    if latest_time > self._kf_last_sync_time:
+                        self._kf_last_sync_time = latest_time
+
+                    for msg in new_user_msgs:
+                        await self._process_kf_message(msg)
+
+        except Exception as e:
+            logger.error(f"微信客服消息拉取异常: {e}")
+
+    async def _process_kf_message(
+        self, msg: dict
+    ) -> None:
+        """处理单条微信客服消息"""
+        msgtype = msg.get("msgtype", "")
+        msgid = msg.get("msgid", "")
+
+        # 消息去重
+        if msgid and msgid in self._kf_processed_msgids:
+            logger.debug("跳过已处理的微信客服消息: %s", msgid)
+            return
+        if msgid:
+            self._kf_processed_msgids.add(msgid)
+            # 限制集合大小，防止内存泄漏
+            if len(self._kf_processed_msgids) > 1000:
+                # 保留最近 500 条
+                self._kf_processed_msgids = set(list(self._kf_processed_msgids)[-500:])
+
+        if msgtype not in ("text", "image", "miniprogram"):
+            logger.debug("忽略微信客服消息类型: %s", msgtype)
+            return
+
+        # 构建 AstrBotMessage
+        abm = AstrBotMessage()
+        abm.self_id = self.bot_name or "astrbot"
+        abm.message_id = msgid or str(uuid.uuid4())
+        abm.timestamp = msg.get("send_time", int(time.time()))
+        abm.raw_message = msg
+        abm.sender = MessageMember(
+            user_id=msg.get("external_userid", "unknown"),
+            nickname=msg.get("external_userid", "unknown"),
+        )
+        abm.type = MessageType.FRIEND_MESSAGE
+        session_id = format_session_id(
+            "wecomai", msg.get("external_userid", "unknown")
+        )
+        abm.session_id = session_id
+        abm.message = []
+
+        # 记录最新会话信息
+        self._last_open_kfid = msg.get("open_kfid", "")
+        self._last_external_userid = msg.get("external_userid", "")
+
+        if msgtype == "text":
+            content = msg.get("text", {}).get("content", "")
+            abm.message_str = content
+            abm.message.append(Plain(content))
+        elif msgtype == "image":
+            abm.message_str = "[图片]"
+            abm.message.append(Plain("[图片]"))
+        elif msgtype == "miniprogram":
+            # 小程序消息转为文本提示
+            title = msg.get("miniprogram", {}).get("title", "小程序消息")
+            abm.message_str = f"[{title}]"
+            abm.message.append(Plain(f"[{title}]"))
+
+        logger.debug(f"微信客服消息: {abm.message_str}")
+
+        # 创建消息事件，传入 KF 发送回调
+        message_event = WecomAIBotMessageEvent(
+            message_str=abm.message_str,
+            message_obj=abm,
+            platform_meta=self.meta(),
+            session_id=abm.session_id,
+            api_client=self.api_client,
+            queue_mgr=self.queue_mgr,
+            webhook_client=self.webhook_client,
+            only_use_webhook_url_to_send=self.only_use_webhook_url_to_send,
+            kf_sender=self._make_kf_sender(),
+        )
+        message_event.is_at_or_wake_command = True
+        message_event.is_wake = True
+        self.commit_event(message_event)
+
+    def _make_kf_sender(self):
+        """创建一个闭包，用于在事件 send() 时通过微信客服 API 发送消息"""
+        adapter = self  # 避免闭包捕获不可变字符串的快照
+
+        async def kf_send(message_chain: MessageChain) -> None:
+            open_kfid = adapter._last_open_kfid
+            external_userid = adapter._last_external_userid
+            if not open_kfid or not external_userid:
+                logger.warning("微信客服发送跳过: 缺少 open_kfid 或 external_userid")
+                return
+            logger.info(f"通过微信客服 API 发送回复给 {external_userid}")
+            await adapter._send_kf_message(open_kfid, external_userid, message_chain)
+
+        return kf_send
 
     def run(self) -> Awaitable[Any]:
         """运行适配器，同时启动HTTP服务器和队列监听器"""
