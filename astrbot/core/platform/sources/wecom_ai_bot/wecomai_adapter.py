@@ -6,7 +6,8 @@
 import asyncio
 import base64
 import hashlib
-import json
+import os
+import tempfile
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -16,7 +17,7 @@ import aiohttp
 
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
-from astrbot.api.message_components import At, Image, Plain
+from astrbot.api.message_components import At, Image, Plain, Record
 from astrbot.api.platform import (
     AstrBotMessage,
     MessageMember,
@@ -695,6 +696,53 @@ class WecomAIBotAdapter(Platform):
                     "微信客服发送消息跳过: message_chain 中无可发送的组件"
                 )
 
+    async def _download_voice_media(self, media_id: str) -> str | None:
+        """下载微信客服语音媒体文件，返回本地文件路径"""
+        corpid = self.config.get("corpid", "")
+        corpsecret = self.config.get("corpsecret", "")
+        if not corpid or not corpsecret:
+            logger.warning("无法下载语音: corpid/corpsecret 未配置")
+            return None
+
+        async with aiohttp.ClientSession() as session:
+            # 获取 access_token
+            async with session.get(
+                "https://qyapi.weixin.qq.com/cgi-bin/gettoken",
+                params={"corpid": corpid, "corpsecret": corpsecret},
+            ) as resp:
+                token_data = await resp.json()
+                if token_data.get("errcode", -1) != 0:
+                    logger.warning(f"获取 access_token 失败: {token_data.get('errmsg')}")
+                    return None
+                access_token = token_data["access_token"]
+
+            # 下载语音文件
+            url = f"https://qyapi.weixin.qq.com/cgi-bin/media/get?access_token={access_token}&media_id={media_id}"
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    logger.warning(f"语音下载失败: HTTP {resp.status}")
+                    return None
+
+                # 检查是否是 JSON 错误响应
+                content_type = resp.content_type or ""
+                if "json" in content_type:
+                    err_data = await resp.json()
+                    logger.warning(f"语音下载返回错误: {err_data}")
+                    return None
+
+                # 保存到临时文件
+                audio_data = await resp.read()
+                if not audio_data:
+                    logger.warning("语音下载: 空数据")
+                    return None
+
+                tmp_dir = tempfile.gettempdir()
+                tmp_path = os.path.join(tmp_dir, f"wecom_voice_{media_id}.amr")
+                with open(tmp_path, "wb") as f:
+                    f.write(audio_data)
+                logger.info(f"语音已下载: {tmp_path} ({len(audio_data)} bytes)")
+                return f"file:///{tmp_path}"
+
     async def _sync_kf_messages(self) -> None:
         """拉取微信客服消息并处理。"""
         if self._kf_sync_lock.locked():
@@ -769,7 +817,7 @@ class WecomAIBotAdapter(Platform):
                     new_user_msgs = []
                     for msg in msg_list:
                         msgtype = msg.get("msgtype", "")
-                        if msgtype not in ("text", "image", "miniprogram"):
+                        if msgtype not in ("text", "image", "miniprogram", "voice"):
                             continue
                         send_time = msg.get("send_time", 0)
                         if send_time <= self._kf_last_sync_time:
@@ -852,8 +900,24 @@ class WecomAIBotAdapter(Platform):
             abm.message_str = f"[{title}]"
             abm.message.append(Plain(f"[{title}]"))
         elif msgtype == "voice":
-            abm.message_str = "[语音消息]"
-            abm.message.append(Plain("[语音消息]"))
+            voice_data = msg.get("voice", {})
+            media_id = voice_data.get("media_id", "")
+            if media_id:
+                try:
+                    audio_url = await self._download_voice_media(media_id)
+                    if audio_url:
+                        abm.message_str = "[语音消息]"
+                        abm.message.append(Record(file=audio_url))
+                    else:
+                        abm.message_str = "[语音消息]"
+                        abm.message.append(Plain("[语音消息]"))
+                except Exception as e:
+                    logger.warning(f"语音下载失败: {e}")
+                    abm.message_str = "[语音消息]"
+                    abm.message.append(Plain("[语音消息]"))
+            else:
+                abm.message_str = "[语音消息]"
+                abm.message.append(Plain("[语音消息]"))
 
         logger.debug(f"微信客服消息: {abm.message_str}")
 
