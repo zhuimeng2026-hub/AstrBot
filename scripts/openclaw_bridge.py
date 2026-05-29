@@ -1,12 +1,17 @@
 """
 OpenAI-compatible API bridge for OpenClaw.
 Routes messages to specialized OpenClaw agents based on content type.
+
+For image messages, saves base64 images to temp files and passes local file
+paths using openclaw's native [Image: source: /path] format. This avoids the
+Linux MAX_ARG_STRLEN (128KB) CLI limit while keeping full image quality.
 """
 
+import base64
 import json
 import os
 import subprocess
-import sys
+import tempfile
 import time
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -30,6 +35,21 @@ TOOL_KEYWORDS = ["快递", "物流", "单号", "库存", "查询", "订单", "�
 def needs_tools(message: str) -> bool:
     """Check if message needs OpenClaw tools."""
     return any(kw in message for kw in TOOL_KEYWORDS)
+
+
+def save_data_url_to_file(data_url: str) -> str | None:
+    """Save a data:image/... base64 URL to a temp file, return file path."""
+    try:
+        header, b64data = data_url.split(",", 1)
+        mime = header.split(";")[0].split(":")[1]
+        ext = "." + mime.split("/")[1].replace("jpeg", "jpg")
+        raw = base64.b64decode(b64data)
+        fd, path = tempfile.mkstemp(suffix=ext, dir="/tmp")
+        os.write(fd, raw)
+        os.close(fd)
+        return path
+    except Exception:
+        return None
 
 
 def call_openclaw_agent(message: str, session_id: str | None = None, agent_id: str = "main") -> str:
@@ -124,6 +144,7 @@ class OpenClawBridgeHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def handle_chat_completions(self):
+        temp_files = []
         try:
             body = self.read_body()
             messages = body.get("messages", [])
@@ -138,9 +159,21 @@ class OpenClawBridgeHandler(BaseHTTPRequestHandler):
 
             # Route by content type to specialized agents
             if has_images:
-                # Pass image data URLs in the message for image-agent
-                img_refs = " ".join(f"Image: {url}" for url in image_data_urls)
-                agent_msg = f"{user_msg}\n{img_refs}" if user_msg else img_refs
+                # Save base64 images to temp files and use openclaw's native
+                # [Image: source: /path] format. This avoids the Linux
+                # MAX_ARG_STRLEN (128KB) CLI limit with zero quality loss.
+                img_refs = []
+                for url in image_data_urls:
+                    path = save_data_url_to_file(url)
+                    if path:
+                        img_refs.append(f"[Image: source: {path}]")
+                        temp_files.append(path)
+
+                if img_refs:
+                    ref_str = " ".join(img_refs)
+                    agent_msg = f"{user_msg}\n{ref_str}" if user_msg else ref_str
+                else:
+                    agent_msg = user_msg or "Please describe this image"
                 agent_id = AGENT_IMAGE
             elif needs_tools(user_msg):
                 agent_id = AGENT_TOOL
@@ -175,6 +208,12 @@ class OpenClawBridgeHandler(BaseHTTPRequestHandler):
                 })
         except Exception as e:
             self.send_error(500, str(e))
+        finally:
+            for f in temp_files:
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass
 
     def send_stream_response(self, reply: str, model: str):
         self.send_response(200)
