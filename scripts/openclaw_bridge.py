@@ -41,17 +41,26 @@ def call_aikey(messages: list, model: str = AIKEY_MODEL) -> str:
         "Authorization": f"Bearer {AIKEY_KEY}",
         "Content-Type": "application/json",
     }
+    # Truncate: keep system + last 10 messages to avoid token overflow
+    if len(messages) > 12:
+        system_msgs = [m for m in messages if m.get("role") == "system"]
+        other_msgs = [m for m in messages if m.get("role") != "system"]
+        messages = system_msgs + other_msgs[-10:]
+        print(f"[bridge] truncated to {len(messages)} messages", flush=True)
+
     body = json.dumps({
         "model": model,
         "messages": messages,
     }).encode()
 
+    print(f"[bridge] call_aikey: model={model}, msg_count={len(messages)}", flush=True)
     req = Request(url, data=body, headers=headers, method="POST")
     try:
         with urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read())
             return data["choices"][0]["message"]["content"]
     except Exception as e:
+        print(f"[bridge] call_aikey error: {e}", flush=True)
         return f"AIKey error: {e}"
 
 
