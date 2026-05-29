@@ -506,8 +506,13 @@ class WecomAIBotAdapter(Platform):
         elif msgtype == WecomAIBotConstants.MSG_TYPE_IMAGE:
             image_payload = message_data.get("image", {})
             image_url = image_payload.get("url", "")
+            media_id = image_payload.get("media_id", "")
             if image_url:
                 _img_url_to_process.append((image_url, image_payload.get("aeskey")))
+            elif media_id:
+                img_bytes = await self._download_media(media_id)
+                if img_bytes:
+                    image_base64.append(base64.b64encode(img_bytes).decode("utf-8"))
         elif msgtype == WecomAIBotConstants.MSG_TYPE_MIXED:
             # 提取混合消息中的文本内容
             msg_items = WecomAIBotMessageParser.parse_mixed_message(message_data)
@@ -520,10 +525,15 @@ class WecomAIBotAdapter(Platform):
                 elif item.get("msgtype") == WecomAIBotConstants.MSG_TYPE_IMAGE:
                     image_payload = item.get("image", {})
                     image_url = image_payload.get("url", "")
+                    media_id = image_payload.get("media_id", "")
                     if image_url:
                         _img_url_to_process.append(
                             (image_url, image_payload.get("aeskey"))
                         )
+                    elif media_id:
+                        img_bytes = await self._download_media(media_id)
+                        if img_bytes:
+                            image_base64.append(base64.b64encode(img_bytes).decode("utf-8"))
             content = " ".join(text_parts) if text_parts else ""
         else:
             content = f"[{msgtype}消息]"
