@@ -19,7 +19,7 @@ OPENCLAW_BIN = os.environ.get("OPENCLAW_BIN", "/usr/bin/openclaw")
 # AIKey (newapi) for simple text passthrough
 AIKEY_BASE = os.environ.get("AIKEY_BASE", "https://aikey.aixifs.com/v1")
 AIKEY_KEY = os.environ.get("AIKEY_KEY", "t7npV6raGbd2f4HOMR4RRi0gsK2MbvPWk5TMs4i8Q9eJ80cG")
-AIKEY_MODEL = os.environ.get("AIKEY_MODEL", "mimo-v2.5-pro")
+AIKEY_MODEL = os.environ.get("AIKEY_MODEL", "mimo-v2.5")
 AIKEY_VISION_MODEL = os.environ.get("AIKEY_VISION_MODEL", "mimo-v2.5")
 
 SESSION_MAP = {}
