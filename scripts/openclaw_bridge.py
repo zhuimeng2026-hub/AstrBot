@@ -1,26 +1,24 @@
 """
 OpenAI-compatible API bridge for OpenClaw.
-Routes simple text to AIKey (newapi) directly,
-complex/tool requests to openclaw agent.
+Routes messages to specialized OpenClaw agents based on content type.
 """
 
-import asyncio
 import json
 import os
+import subprocess
 import sys
 import time
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.request import Request, urlopen
 
 PORT = int(os.environ.get("OPENCLAW_BRIDGE_PORT", "8643"))
 OPENCLAW_BIN = os.environ.get("OPENCLAW_BIN", "/usr/bin/openclaw")
 
-# AIKey (newapi) for simple text passthrough
-AIKEY_BASE = os.environ.get("AIKEY_BASE", "https://aikey.aixifs.com/v1")
-AIKEY_KEY = os.environ.get("AIKEY_KEY", "t7npV6raGbd2f4HOMR4RRi0gsK2MbvPWk5TMs4i8Q9eJ80cG")
-AIKEY_MODEL = os.environ.get("AIKEY_MODEL", "mimo-v2.5")
-AIKEY_VISION_MODEL = os.environ.get("AIKEY_VISION_MODEL", "mimo-v2.5")
+# Agent routing
+AGENT_TEXT = os.environ.get("AGENT_TEXT", "text-agent")
+AGENT_IMAGE = os.environ.get("AGENT_IMAGE", "image-agent")
+AGENT_VOICE = os.environ.get("AGENT_VOICE", "voice-agent")
+AGENT_TOOL = os.environ.get("AGENT_TOOL", "main")
 
 SESSION_MAP = {}
 
@@ -29,57 +27,13 @@ TOOL_KEYWORDS = ["快递", "物流", "单号", "库存", "查询", "订单", "�
                  "express", "tracking", "inventory", "order", "ship"]
 
 
-def needs_openclaw(message: str) -> bool:
+def needs_tools(message: str) -> bool:
     """Check if message needs OpenClaw tools."""
     return any(kw in message for kw in TOOL_KEYWORDS)
 
 
-def call_aikey(messages: list, model: str = AIKEY_MODEL) -> str:
-    """Call AIKey (newapi) directly for simple text."""
-    url = f"{AIKEY_BASE}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {AIKEY_KEY}",
-        "Content-Type": "application/json",
-    }
-    # Strip image_url parts from history to avoid 404 on non-vision models
-    cleaned = []
-    for msg in messages:
-        content = msg.get("content")
-        if isinstance(content, list):
-            text_parts = [p for p in content if p.get("type") == "text"]
-            if text_parts:
-                cleaned.append({**msg, "content": text_parts})
-            else:
-                cleaned.append({**msg, "content": [{"type": "text", "text": "[图片]"}]})
-        else:
-            cleaned.append(msg)
-    messages = cleaned
-
-    body = json.dumps({
-        "model": model,
-        "messages": messages,
-    }).encode()
-
-    print(f"[bridge] call_aikey: model={model}, msg_count={len(messages)}, body_size={len(body)} bytes", flush=True)
-    req = Request(url, data=body, headers=headers, method="POST")
-    try:
-        with urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read())
-            return data["choices"][0]["message"]["content"]
-    except Exception as e:
-        detail = ""
-        if hasattr(e, 'fp') and e.fp:
-            try:
-                detail = e.fp.read().decode('utf-8', errors='replace')[:500]
-            except Exception:
-                pass
-        print(f"[bridge] call_aikey error: {e}, detail={detail}", flush=True)
-        return f"AIKey error: {e}"
-
-
 def call_openclaw_agent(message: str, session_id: str | None = None, agent_id: str = "main") -> str:
     """Call openclaw agent CLI and return the response text."""
-    # Clean stale lock files before each call
     import glob as _glob
     for lock in _glob.glob(f"/root/.openclaw/agents/{agent_id}/sessions/*.lock"):
         try:
@@ -94,14 +48,10 @@ def call_openclaw_agent(message: str, session_id: str | None = None, agent_id: s
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=130)
-        # OpenClaw outputs JSON to stderr, not stdout
         output = result.stderr or result.stdout
-        # Parse the full output as a stream of JSON objects
-        # OpenClaw outputs multiple JSON objects; find the one with "payloads"
         decoder = json.JSONDecoder()
         idx = 0
         while idx < len(output):
-            # Skip whitespace
             while idx < len(output) and output[idx] in " \t\n\r":
                 idx += 1
             if idx >= len(output):
@@ -119,15 +69,35 @@ def call_openclaw_agent(message: str, session_id: str | None = None, agent_id: s
             except json.JSONDecodeError:
                 idx += 1
         return "OpenClaw returned no usable response"
-        # Fallback: return raw output
-        return output.strip()[-500:] if output.strip() else "OpenClaw returned no response"
     except subprocess.TimeoutExpired:
         return "OpenClaw agent timed out"
     except Exception as e:
         return f"OpenClaw bridge error: {e}"
 
 
-import subprocess
+def extract_message_info(messages: list) -> tuple[str, bool, list[str]]:
+    """Extract user message text, image presence, and image data URLs."""
+    user_msg = ""
+    has_images = False
+    image_data_urls = []
+
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                text_parts = [p.get("text", "") for p in content if p.get("type") == "text"]
+                user_msg = " ".join(text_parts)
+                for p in content:
+                    if p.get("type") == "image_url":
+                        has_images = True
+                        url = p.get("image_url", {}).get("url", "")
+                        if url:
+                            image_data_urls.append(url)
+            else:
+                user_msg = content
+            break
+
+    return user_msg, has_images, image_data_urls
 
 
 class OpenClawBridgeHandler(BaseHTTPRequestHandler):
@@ -160,37 +130,33 @@ class OpenClawBridgeHandler(BaseHTTPRequestHandler):
             model = body.get("model", "openclaw-agent")
             stream = body.get("stream", False)
 
-            # Extract user message and check for images
-            user_msg = ""
-            has_images = False
-            for msg in reversed(messages):
-                if msg.get("role") == "user":
-                    content = msg.get("content", "")
-                    if isinstance(content, list):
-                        user_msg = " ".join(p.get("text", "") for p in content if p.get("type") == "text")
-                        has_images = any(p.get("type") == "image_url" for p in content)
-                    else:
-                        user_msg = content
-                    break
-
-            print(f"[bridge] model={model} has_images={has_images} user_msg={user_msg[:80]!r}", flush=True)
+            user_msg, has_images, image_data_urls = extract_message_info(messages)
 
             if not user_msg and not has_images:
                 self.send_error(400, "No user message found")
                 return
 
-            # Route: images → AIKey vision model, simple text → AIKey, tool-needed → OpenClaw
+            # Route by content type to specialized agents
             if has_images:
-                print(f"[bridge] 路由到视觉模型: {AIKEY_VISION_MODEL}", flush=True)
-                reply = call_aikey(messages, model=AIKEY_VISION_MODEL)
-            elif needs_openclaw(user_msg):
-                session_key = str(hash(json.dumps(messages[:3])))[:16]
-                session_id = SESSION_MAP.get(session_key)
-                reply = call_openclaw_agent(user_msg, session_id)
-                if not session_id:
-                    SESSION_MAP[session_key] = str(uuid.uuid4())[:8]
+                # Pass image data URLs in the message for image-agent
+                img_refs = " ".join(f"Image: {url}" for url in image_data_urls)
+                agent_msg = f"{user_msg}\n{img_refs}" if user_msg else img_refs
+                agent_id = AGENT_IMAGE
+            elif needs_tools(user_msg):
+                agent_id = AGENT_TOOL
+                agent_msg = user_msg
             else:
-                reply = call_aikey(messages)
+                agent_id = AGENT_TEXT
+                agent_msg = user_msg
+
+            session_key = str(hash(json.dumps(messages[:3])))[:16]
+            session_id = SESSION_MAP.get(session_key)
+            print(f"[bridge] agent={agent_id} has_images={has_images} msg={user_msg[:80]!r}", flush=True)
+
+            reply = call_openclaw_agent(agent_msg, session_id, agent_id)
+
+            if not session_id:
+                SESSION_MAP[session_key] = str(uuid.uuid4())[:8]
 
             if stream:
                 self.send_stream_response(reply, model)
@@ -215,8 +181,6 @@ class OpenClawBridgeHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
-
-        # Send as single chunk
         chunk = {
             "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
             "object": "chat.completion.chunk",
@@ -249,12 +213,13 @@ class OpenClawBridgeHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, format, *args):
-        pass  # Suppress default logging
+        pass
 
 
 def main():
     server = HTTPServer(("127.0.0.1", PORT), OpenClawBridgeHandler)
     print(f"OpenClaw bridge listening on http://127.0.0.1:{PORT}")
+    print(f"  text-agent={AGENT_TEXT}  image-agent={AGENT_IMAGE}  voice-agent={AGENT_VOICE}  tool-agent={AGENT_TOOL}")
     server.serve_forever()
 
 
