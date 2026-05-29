@@ -41,26 +41,39 @@ def call_aikey(messages: list, model: str = AIKEY_MODEL) -> str:
         "Authorization": f"Bearer {AIKEY_KEY}",
         "Content-Type": "application/json",
     }
-    # Truncate: keep system + last 10 messages to avoid token overflow
-    if len(messages) > 12:
-        system_msgs = [m for m in messages if m.get("role") == "system"]
-        other_msgs = [m for m in messages if m.get("role") != "system"]
-        messages = system_msgs + other_msgs[-10:]
-        print(f"[bridge] truncated to {len(messages)} messages", flush=True)
+    # Strip image_url parts from history to avoid 404 on non-vision models
+    cleaned = []
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            text_parts = [p for p in content if p.get("type") == "text"]
+            if text_parts:
+                cleaned.append({**msg, "content": text_parts})
+            else:
+                cleaned.append({**msg, "content": [{"type": "text", "text": "[图片]"}]})
+        else:
+            cleaned.append(msg)
+    messages = cleaned
 
     body = json.dumps({
         "model": model,
         "messages": messages,
     }).encode()
 
-    print(f"[bridge] call_aikey: model={model}, msg_count={len(messages)}", flush=True)
+    print(f"[bridge] call_aikey: model={model}, msg_count={len(messages)}, body_size={len(body)} bytes", flush=True)
     req = Request(url, data=body, headers=headers, method="POST")
     try:
         with urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read())
             return data["choices"][0]["message"]["content"]
     except Exception as e:
-        print(f"[bridge] call_aikey error: {e}", flush=True)
+        detail = ""
+        if hasattr(e, 'fp') and e.fp:
+            try:
+                detail = e.fp.read().decode('utf-8', errors='replace')[:500]
+            except Exception:
+                pass
+        print(f"[bridge] call_aikey error: {e}, detail={detail}", flush=True)
         return f"AIKey error: {e}"
 
 
