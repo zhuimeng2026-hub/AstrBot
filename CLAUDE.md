@@ -52,7 +52,7 @@ Hooks run `ruff check --fix`, `ruff format`, and `pyupgrade --py310-plus` on com
 **Event Bus** (`event_bus.py`): Async queue that receives `AstrMessageEvent` from all platforms. The `dispatch()` loop dequeues events, resolves the config ID via `AstrBotConfigRouter`, and spawns `asyncio.Task` per event through the appropriate `PipelineScheduler`.
 
 **Pipeline** (`pipeline/`): Message processing stages run in order via `PipelineScheduler`. Each stage is a class with a `process()` method that returns either a coroutine or an `AsyncGenerator` (for onion-model pre/post processing). Stages execute in this order:
-`preprocess` → `whitelist_check` → `rate_limit_check` → `waking_check` → `session_status_check` → `content_safety_check` → `process_stage` → `result_decorate` → `respond`
+`waking_check` → `whitelist_check` → `session_status_check` → `rate_limit_check` → `content_safety_check` → `preprocess` → `process_stage` → `result_decorate` → `respond`
 
 Stage order is defined in `pipeline/stage_order.py`. The scheduler supports recursive nesting via the `AsyncGenerator` pattern (onion model).
 

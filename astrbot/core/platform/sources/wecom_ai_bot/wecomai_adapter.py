@@ -814,7 +814,7 @@ class WecomAIBotAdapter(Platform):
                 # 保留最近 500 条
                 self._kf_processed_msgids = set(list(self._kf_processed_msgids)[-500:])
 
-        if msgtype not in ("text", "image", "miniprogram"):
+        if msgtype not in ("text", "image", "miniprogram", "voice"):
             logger.debug("忽略微信客服消息类型: %s", msgtype)
             return
 
@@ -851,6 +851,9 @@ class WecomAIBotAdapter(Platform):
             title = msg.get("miniprogram", {}).get("title", "小程序消息")
             abm.message_str = f"[{title}]"
             abm.message.append(Plain(f"[{title}]"))
+        elif msgtype == "voice":
+            abm.message_str = "[语音消息]"
+            abm.message.append(Plain("[语音消息]"))
 
         logger.debug(f"微信客服消息: {abm.message_str}")
 
@@ -870,9 +873,23 @@ class WecomAIBotAdapter(Platform):
         message_event.is_wake = True
         self.commit_event(message_event)
 
+        # 立即发送确认消息并记录开始时间
+        open_kfid = self._last_open_kfid
+        external_userid = self._last_external_userid
+        asyncio.create_task(self._send_kf_ack(open_kfid, external_userid))
+        self._kf_task_start_time = time.time()
+
+    async def _send_kf_ack(self, open_kfid: str, external_userid: str) -> None:
+        """立即发送任务确认消息"""
+        ack_chain = MessageChain([Plain("任务收到，正在安排处理中。。。")])
+        try:
+            await self._send_kf_message(open_kfid, external_userid, ack_chain)
+        except Exception as e:
+            logger.warning("发送确认消息失败: %s", e)
+
     def _make_kf_sender(self):
-        """创建一个闭包，用于在事件 send() 时通过微信客服 API 发送消息"""
-        adapter = self  # 避免闭包捕获不可变字符串的快照
+        """创建一个闭包，用于在事件 send() 时通过微信客服 API 发送消息，并附带耗时"""
+        adapter = self
 
         async def kf_send(message_chain: MessageChain) -> None:
             open_kfid = adapter._last_open_kfid
@@ -880,6 +897,19 @@ class WecomAIBotAdapter(Platform):
             if not open_kfid or not external_userid:
                 logger.warning("微信客服发送跳过: 缺少 open_kfid 或 external_userid")
                 return
+
+            # 计算耗时并附带到回复中
+            start_time = getattr(adapter, "_kf_task_start_time", 0)
+            if start_time:
+                elapsed = time.time() - start_time
+                adapter._kf_task_start_time = 0
+                elapsed_text = f"\n\n⏱ 耗时: {elapsed:.1f}秒"
+                # 在第一个 Plain 组件前插入耗时信息
+                for comp in message_chain.chain:
+                    if isinstance(comp, Plain):
+                        comp.text = elapsed_text + "\n" + comp.text
+                        break
+
             logger.info(f"通过微信客服 API 发送回复给 {external_userid}")
             await adapter._send_kf_message(open_kfid, external_userid, message_chain)
 

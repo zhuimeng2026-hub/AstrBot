@@ -1,6 +1,7 @@
 """
 OpenAI-compatible API bridge for OpenClaw.
-Wraps `openclaw agent` CLI as a /v1/chat/completions endpoint.
+Routes simple text to AIKey (newapi) directly,
+complex/tool requests to openclaw agent.
 """
 
 import asyncio
@@ -10,14 +11,59 @@ import sys
 import time
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.request import Request, urlopen
 
 PORT = int(os.environ.get("OPENCLAW_BRIDGE_PORT", "8643"))
 OPENCLAW_BIN = os.environ.get("OPENCLAW_BIN", "/usr/bin/openclaw")
-SESSION_MAP = {}  # track session IDs per conversation
+
+# AIKey (newapi) for simple text passthrough
+AIKEY_BASE = os.environ.get("AIKEY_BASE", "https://aikey.aixifs.com/v1")
+AIKEY_KEY = os.environ.get("AIKEY_KEY", "t7npV6raGbd2f4HOMR4RRi0gsK2MbvPWk5TMs4i8Q9eJ80cG")
+AIKEY_MODEL = os.environ.get("AIKEY_MODEL", "mimo-v2.5-pro")
+
+SESSION_MAP = {}
+
+# Keywords that indicate OpenClaw tools are needed
+TOOL_KEYWORDS = ["快递", "物流", "单号", "库存", "查询", "订单", "跟踪", "追踪",
+                 "express", "tracking", "inventory", "order", "ship"]
+
+
+def needs_openclaw(message: str) -> bool:
+    """Check if message needs OpenClaw tools."""
+    return any(kw in message for kw in TOOL_KEYWORDS)
+
+
+def call_aikey(messages: list, model: str = AIKEY_MODEL) -> str:
+    """Call AIKey (newapi) directly for simple text."""
+    url = f"{AIKEY_BASE}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {AIKEY_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = json.dumps({
+        "model": model,
+        "messages": messages,
+    }).encode()
+
+    req = Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+            return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"AIKey error: {e}"
 
 
 def call_openclaw_agent(message: str, session_id: str | None = None, agent_id: str = "main") -> str:
     """Call openclaw agent CLI and return the response text."""
+    # Clean stale lock files before each call
+    import glob as _glob
+    for lock in _glob.glob(f"/root/.openclaw/agents/{agent_id}/sessions/*.lock"):
+        try:
+            os.remove(lock)
+        except OSError:
+            pass
+
     cmd = [OPENCLAW_BIN, "agent", "--agent", agent_id, "--message", message, "--json"]
     if session_id:
         cmd.extend(["--session-id", session_id])
@@ -106,16 +152,15 @@ class OpenClawBridgeHandler(BaseHTTPRequestHandler):
                 self.send_error(400, "No user message found")
                 return
 
-            # Derive session from messages hash for continuity
-            session_key = str(hash(json.dumps(messages[:3])))[:16]
-            session_id = SESSION_MAP.get(session_key)
-
-            # Call OpenClaw
-            reply = call_openclaw_agent(user_msg, session_id)
-
-            # Store session for continuity
-            if not session_id:
-                SESSION_MAP[session_key] = str(uuid.uuid4())[:8]
+            # Route: simple text → AIKey, tool-needed → OpenClaw
+            if needs_openclaw(user_msg):
+                session_key = str(hash(json.dumps(messages[:3])))[:16]
+                session_id = SESSION_MAP.get(session_key)
+                reply = call_openclaw_agent(user_msg, session_id)
+                if not session_id:
+                    SESSION_MAP[session_key] = str(uuid.uuid4())[:8]
+            else:
+                reply = call_aikey(messages)
 
             if stream:
                 self.send_stream_response(reply, model)

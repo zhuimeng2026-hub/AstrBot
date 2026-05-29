@@ -3,6 +3,7 @@ import hashlib
 import logging
 import os
 import socket
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol, cast
@@ -500,7 +501,19 @@ class AstrBotDashboard:
         if isinstance(port, str):
             port = int(port)
 
-        if self.check_port_in_use(port):
+        # Retry if port is occupied (previous instance may still be shutting down)
+        max_retries = 6
+        for attempt in range(max_retries):
+            if not self.check_port_in_use(port):
+                break
+            if attempt == 0:
+                process_info = self.get_process_using_port(port)
+                logger.warning(
+                    f"端口 {port} 被占用，等待释放中...\n"
+                    f"占用信息: {process_info}"
+                )
+            time.sleep(5)
+        else:
             process_info = self.get_process_using_port(port)
             logger.error(
                 f"错误：端口 {port} 已被占用\n"
@@ -510,7 +523,6 @@ class AstrBotDashboard:
                 f"2. 端口 {port} 没有被其他程序占用\n"
                 f"3. 如需使用其他端口，请修改配置文件",
             )
-
             raise Exception(f"端口 {port} 已被占用")
 
         parts = [f"\n ✨✨✨\n  AstrBot v{VERSION} WebUI is ready\n\n"]
