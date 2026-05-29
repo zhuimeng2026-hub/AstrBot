@@ -695,6 +695,57 @@ class WecomAIBotAdapter(Platform):
                     "微信客服发送消息跳过: message_chain 中无可发送的组件"
                 )
 
+    async def _download_kf_media(self, media_id: str) -> str | None:
+        """下载微信客服媒体文件，返回 base64 编码"""
+        corpid = self.config.get("corpid", "")
+        corpsecret = self.config.get("corpsecret", "")
+        if not corpid or not corpsecret:
+            logger.error("下载媒体失败: 未配置 corpid/corpsecret")
+            return None
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                # 获取 access_token
+                async with session.get(
+                    "https://qyapi.weixin.qq.com/cgi-bin/gettoken",
+                    params={"corpid": corpid, "corpsecret": corpsecret},
+                ) as resp:
+                    token_data = await resp.json()
+                    if token_data.get("errcode", -1) != 0:
+                        logger.error("获取 access_token 失败: %s", token_data.get("errmsg"))
+                        return None
+                    access_token = token_data["access_token"]
+
+                # 下载媒体文件
+                async with session.get(
+                    "https://qyapi.weixin.qq.com/cgi-bin/media/get",
+                    params={"access_token": access_token, "media_id": media_id},
+                ) as resp:
+                    if resp.status != 200:
+                        logger.error("下载媒体失败: HTTP %s", resp.status)
+                        return None
+
+                    # 检查是否是 JSON 错误响应
+                    content_type = resp.headers.get("Content-Type", "")
+                    if "json" in content_type:
+                        err = await resp.json()
+                        logger.error("下载媒体失败: %s", err.get("errmsg"))
+                        return None
+
+                    image_data = await resp.read()
+                    if len(image_data) < 100:
+                        logger.error("下载媒体数据异常: 大小 %d 字节", len(image_data))
+                        return None
+
+                    import base64 as b64
+                    result = b64.b64encode(image_data).decode("utf-8")
+                    logger.info("下载媒体成功: media_id=%s, 大小=%d", media_id, len(image_data))
+                    return result
+
+        except Exception as e:
+            logger.error("下载媒体异常: %s", e)
+            return None
+
     async def _sync_kf_messages(self) -> None:
         """拉取微信客服消息并处理。"""
         if self._kf_sync_lock.locked():
@@ -844,8 +895,19 @@ class WecomAIBotAdapter(Platform):
             abm.message_str = content
             abm.message.append(Plain(content))
         elif msgtype == "image":
-            abm.message_str = "[图片]"
-            abm.message.append(Plain("[图片]"))
+            media_id = msg.get("image", {}).get("media_id", "")
+            if media_id:
+                # 下载图片并转为 base64
+                image_base64 = await self._download_kf_media(media_id)
+                if image_base64:
+                    abm.message_str = "[图片]"
+                    abm.message.append(Image.fromBase64(image_base64))
+                else:
+                    abm.message_str = "[图片下载失败]"
+                    abm.message.append(Plain("[图片下载失败]"))
+            else:
+                abm.message_str = "[图片]"
+                abm.message.append(Plain("[图片]"))
         elif msgtype == "miniprogram":
             # 小程序消息转为文本提示
             title = msg.get("miniprogram", {}).get("title", "小程序消息")
