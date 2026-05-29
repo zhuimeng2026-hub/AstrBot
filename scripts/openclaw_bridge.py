@@ -20,6 +20,7 @@ OPENCLAW_BIN = os.environ.get("OPENCLAW_BIN", "/usr/bin/openclaw")
 AIKEY_BASE = os.environ.get("AIKEY_BASE", "https://aikey.aixifs.com/v1")
 AIKEY_KEY = os.environ.get("AIKEY_KEY", "t7npV6raGbd2f4HOMR4RRi0gsK2MbvPWk5TMs4i8Q9eJ80cG")
 AIKEY_MODEL = os.environ.get("AIKEY_MODEL", "mimo-v2.5-pro")
+AIKEY_VISION_MODEL = os.environ.get("AIKEY_VISION_MODEL", "mimo-v2-omni")
 
 SESSION_MAP = {}
 
@@ -137,23 +138,27 @@ class OpenClawBridgeHandler(BaseHTTPRequestHandler):
             model = body.get("model", "openclaw-agent")
             stream = body.get("stream", False)
 
-            # Extract user message (last user message)
+            # Extract user message and check for images
             user_msg = ""
+            has_images = False
             for msg in reversed(messages):
                 if msg.get("role") == "user":
                     content = msg.get("content", "")
                     if isinstance(content, list):
                         user_msg = " ".join(p.get("text", "") for p in content if p.get("type") == "text")
+                        has_images = any(p.get("type") == "image_url" for p in content)
                     else:
                         user_msg = content
                     break
 
-            if not user_msg:
+            if not user_msg and not has_images:
                 self.send_error(400, "No user message found")
                 return
 
-            # Route: simple text → AIKey, tool-needed → OpenClaw
-            if needs_openclaw(user_msg):
+            # Route: images → AIKey vision model, simple text → AIKey, tool-needed → OpenClaw
+            if has_images:
+                reply = call_aikey(messages, model=AIKEY_VISION_MODEL)
+            elif needs_openclaw(user_msg):
                 session_key = str(hash(json.dumps(messages[:3])))[:16]
                 session_id = SESSION_MAP.get(session_key)
                 reply = call_openclaw_agent(user_msg, session_id)

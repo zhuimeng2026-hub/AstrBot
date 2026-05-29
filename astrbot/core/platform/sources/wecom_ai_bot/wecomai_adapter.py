@@ -892,8 +892,30 @@ class WecomAIBotAdapter(Platform):
             abm.message_str = content
             abm.message.append(Plain(content))
         elif msgtype == "image":
-            abm.message_str = "[图片]"
-            abm.message.append(Plain("[图片]"))
+            image_data = msg.get("image", {})
+            image_url = image_data.get("url", "")
+            if image_url:
+                try:
+                    aes_key = image_data.get("aeskey") or self.encoding_aes_key
+                    success, result = await process_encrypted_image(
+                        image_url, aes_key
+                    )
+                    if success and isinstance(result, bytes):
+                        import base64 as b64
+                        img_b64 = b64.b64encode(result).decode("utf-8")
+                        abm.message_str = "[图片]"
+                        abm.message.append(Image.fromBase64(img_b64))
+                    else:
+                        logger.warning(f"图片处理失败: {result}")
+                        abm.message_str = "[图片]"
+                        abm.message.append(Plain("[图片]"))
+                except Exception as e:
+                    logger.warning(f"图片下载失败: {e}")
+                    abm.message_str = "[图片]"
+                    abm.message.append(Plain("[图片]"))
+            else:
+                abm.message_str = "[图片]"
+                abm.message.append(Plain("[图片]"))
         elif msgtype == "miniprogram":
             # 小程序消息转为文本提示
             title = msg.get("miniprogram", {}).get("title", "小程序消息")
