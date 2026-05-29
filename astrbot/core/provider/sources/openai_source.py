@@ -1405,10 +1405,14 @@ class ProviderOpenAIOfficial(Provider):
 
         # 3. 图片内容
         if image_urls:
+            logger.info(f"[IMG] assemble_context: {len(image_urls)} 张图片待处理")
             for image_url in image_urls:
                 image_part = await self._resolve_image_part(image_url)
                 if image_part:
                     content_blocks.append(image_part)
+                    logger.info(f"[IMG] 图片已加入 content_blocks, url={image_url[:60]}")
+                else:
+                    logger.warning(f"[IMG] 图片解析失败, url={image_url[:60]}")
 
         if audio_urls:
             for audio_path in audio_urls:

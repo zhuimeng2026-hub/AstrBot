@@ -696,6 +696,45 @@ class WecomAIBotAdapter(Platform):
                     "微信客服发送消息跳过: message_chain 中无可发送的组件"
                 )
 
+    async def _download_media(self, media_id: str) -> bytes | None:
+        """通过 media_id 下载微信客服媒体文件，返回原始字节"""
+        corpid = self.config.get("corpid", "")
+        corpsecret = self.config.get("corpsecret", "")
+        if not corpid or not corpsecret:
+            logger.warning("[IMG] 无法下载媒体: corpid/corpsecret 未配置")
+            return None
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://qyapi.weixin.qq.com/cgi-bin/gettoken",
+                    params={"corpid": corpid, "corpsecret": corpsecret},
+                ) as resp:
+                    token_data = await resp.json()
+                    if token_data.get("errcode", -1) != 0:
+                        logger.warning(f"[IMG] 获取 access_token 失败: {token_data.get('errmsg')}")
+                        return None
+                    access_token = token_data["access_token"]
+
+                url = f"https://qyapi.weixin.qq.com/cgi-bin/media/get?access_token={access_token}&media_id={media_id}"
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"[IMG] 媒体下载失败: HTTP {resp.status}")
+                        return None
+                    content_type = resp.content_type or ""
+                    if "json" in content_type:
+                        err_data = await resp.json()
+                        logger.warning(f"[IMG] 媒体下载返回错误: {err_data}")
+                        return None
+                    data = await resp.read()
+                    if not data:
+                        logger.warning("[IMG] 媒体下载: 空数据")
+                        return None
+                    return data
+        except Exception as e:
+            logger.warning(f"[IMG] 媒体下载异常: {e}")
+            return None
+
     async def _download_voice_media(self, media_id: str) -> str | None:
         """下载微信客服语音媒体文件，返回本地文件路径"""
         corpid = self.config.get("corpid", "")
@@ -893,7 +932,14 @@ class WecomAIBotAdapter(Platform):
             abm.message.append(Plain(content))
         elif msgtype == "image":
             image_data = msg.get("image", {})
+            logger.info(f"[IMG] 原始 image_data={image_data}")
             image_url = image_data.get("url", "")
+            media_id = image_data.get("media_id", "")
+            logger.info(f"[IMG] 收到图片消息, url={image_url[:80] if image_url else '(empty)'}, media_id={media_id[:40] if media_id else '(empty)'}")
+
+            img_bytes = None
+
+            # 优先用 url 下载加密图片
             if image_url:
                 try:
                     aes_key = image_data.get("aeskey") or self.encoding_aes_key
@@ -901,19 +947,30 @@ class WecomAIBotAdapter(Platform):
                         image_url, aes_key
                     )
                     if success and isinstance(result, bytes):
-                        import base64 as b64
-                        img_b64 = b64.b64encode(result).decode("utf-8")
-                        abm.message_str = "[图片]"
-                        abm.message.append(Image.fromBase64(img_b64))
+                        img_bytes = result
+                        logger.info(f"[IMG] 通过 url 下载成功, size={len(img_bytes)}")
                     else:
-                        logger.warning(f"图片处理失败: {result}")
-                        abm.message_str = "[图片]"
-                        abm.message.append(Plain("[图片]"))
+                        logger.warning(f"[IMG] url 下载失败: {result}")
                 except Exception as e:
-                    logger.warning(f"图片下载失败: {e}")
-                    abm.message_str = "[图片]"
-                    abm.message.append(Plain("[图片]"))
+                    logger.warning(f"[IMG] url 下载异常: {e}")
+
+            # url 没拿到就用 media_id
+            if not img_bytes and media_id:
+                logger.info(f"[IMG] 尝试通过 media_id 下载图片")
+                img_bytes = await self._download_media(media_id)
+                if img_bytes:
+                    logger.info(f"[IMG] media_id 下载成功, size={len(img_bytes)}")
+                else:
+                    logger.warning("[IMG] media_id 下载失败")
+
+            if img_bytes:
+                import base64 as b64
+                img_b64 = b64.b64encode(img_bytes).decode("utf-8")
+                abm.message_str = "[图片]"
+                abm.message.append(Image.fromBase64(img_b64))
+                logger.info(f"[IMG] 图片已加入消息链, base64_len={len(img_b64)}")
             else:
+                logger.warning("[IMG] 图片获取全部失败, 降级为纯文本")
                 abm.message_str = "[图片]"
                 abm.message.append(Plain("[图片]"))
         elif msgtype == "miniprogram":

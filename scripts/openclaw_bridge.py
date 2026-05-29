@@ -20,7 +20,7 @@ OPENCLAW_BIN = os.environ.get("OPENCLAW_BIN", "/usr/bin/openclaw")
 AIKEY_BASE = os.environ.get("AIKEY_BASE", "https://aikey.aixifs.com/v1")
 AIKEY_KEY = os.environ.get("AIKEY_KEY", "t7npV6raGbd2f4HOMR4RRi0gsK2MbvPWk5TMs4i8Q9eJ80cG")
 AIKEY_MODEL = os.environ.get("AIKEY_MODEL", "mimo-v2.5-pro")
-AIKEY_VISION_MODEL = os.environ.get("AIKEY_VISION_MODEL", "mimo-v2-omni")
+AIKEY_VISION_MODEL = os.environ.get("AIKEY_VISION_MODEL", "mimo-v2.5")
 
 SESSION_MAP = {}
 
@@ -151,12 +151,15 @@ class OpenClawBridgeHandler(BaseHTTPRequestHandler):
                         user_msg = content
                     break
 
+            print(f"[bridge] model={model} has_images={has_images} user_msg={user_msg[:80]!r}", flush=True)
+
             if not user_msg and not has_images:
                 self.send_error(400, "No user message found")
                 return
 
             # Route: images → AIKey vision model, simple text → AIKey, tool-needed → OpenClaw
             if has_images:
+                print(f"[bridge] 路由到视觉模型: {AIKEY_VISION_MODEL}", flush=True)
                 reply = call_aikey(messages, model=AIKEY_VISION_MODEL)
             elif needs_openclaw(user_msg):
                 session_key = str(hash(json.dumps(messages[:3])))[:16]

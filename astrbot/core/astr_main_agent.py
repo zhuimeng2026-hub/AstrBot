@@ -1283,6 +1283,7 @@ async def build_main_agent(
                     req.extra_user_content_parts.append(
                         TextPart(text=f"[Image Attachment: path {image_path}]")
                     )
+                    logger.info(f"[IMG] 提取图片组件: path={image_path}")
                 elif isinstance(comp, Record):
                     audio_path = await comp.convert_to_file_path()
                     req.audio_urls.append(audio_path)

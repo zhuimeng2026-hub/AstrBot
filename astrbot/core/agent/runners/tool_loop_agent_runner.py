@@ -345,6 +345,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             image_urls=request.image_urls if supports_image else [],
             audio_urls=request.audio_urls if supports_audio else [],
         )
+        logger.info(f"[IMG] modalities={modalities} supports_image={supports_image} image_urls_count={len(request.image_urls)}")
         context = await adjusted_request.assemble_context()
         content = context.get("content")
         if isinstance(content, str):
