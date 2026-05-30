@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -24,6 +25,24 @@ class ContextSanitizeStats:
             or self.fixed_tool_messages
             or self.removed_tool_calls
         )
+
+
+_IMAGE_CAPTION_RE = re.compile(r"<image_caption>(.*?)</image_caption>", re.DOTALL)
+
+
+def _extract_all_image_captions(content: list[Any]) -> list[str]:
+    """Extract all <image_caption> texts from content list."""
+    captions: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if str(part.get("type", "")).lower() != "text":
+            continue
+        text = part.get("text", "")
+        match = _IMAGE_CAPTION_RE.search(text)
+        if match:
+            captions.append(match.group(1).strip())
+    return captions
 
 
 def _message_to_dict(message: dict[str, Any] | Message) -> dict[str, Any] | None:
@@ -88,13 +107,24 @@ def sanitize_contexts_by_modalities(
             if isinstance(content, list):
                 filtered_parts: list[Any] = []
                 removed_any_multimodal = False
+                # Pre-extract captions for image replacement
+                image_captions = (
+                    _extract_all_image_captions(content) if not supports_image else []
+                )
                 for part in content:
                     if isinstance(part, dict):
                         part_type = str(part.get("type", "")).lower()
                         if not supports_image and part_type in {"image_url", "image"}:
                             removed_any_multimodal = True
                             stats.fixed_image_blocks += 1
-                            filtered_parts.append({"type": "text", "text": "[Image]"})
+                            if image_captions:
+                                filtered_parts.append(
+                                    {"type": "text", "text": image_captions.pop(0)}
+                                )
+                            else:
+                                filtered_parts.append(
+                                    {"type": "text", "text": "[Image]"}
+                                )
                             continue
                         if not supports_audio and part_type in {
                             "audio_url",
@@ -126,6 +156,7 @@ def _tool_result_placeholder(content: Any) -> str:
     if isinstance(content, str):
         content_text = content.strip()
     elif isinstance(content, list):
+        image_captions = _extract_all_image_captions(content)
         text_parts: list[str] = []
         for part in content:
             if isinstance(part, dict):
@@ -133,7 +164,10 @@ def _tool_result_placeholder(content: Any) -> str:
                 if part_type == "text":
                     text_parts.append(str(part.get("text", "")))
                 elif part_type in {"image_url", "image"}:
-                    text_parts.append("[Image]")
+                    if image_captions:
+                        text_parts.append(image_captions.pop(0))
+                    else:
+                        text_parts.append("[Image]")
                 elif part_type in {"audio_url", "input_audio"}:
                     text_parts.append("[Audio]")
         content_text = "\n".join(part for part in text_parts if part).strip()

@@ -12,9 +12,10 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("OPENCLAW_BRIDGE_PORT", "8643"))
 OPENCLAW_BIN = os.environ.get("OPENCLAW_BIN", "/usr/bin/openclaw")
@@ -26,10 +27,24 @@ AGENT_VOICE = os.environ.get("AGENT_VOICE", "voice-agent")
 AGENT_TOOL = os.environ.get("AGENT_TOOL", "main")
 
 SESSION_MAP = {}
+SESSION_MAP_LOCK = threading.Lock()
 
 # Keywords that indicate OpenClaw tools are needed
-TOOL_KEYWORDS = ["快递", "物流", "单号", "库存", "查询", "订单", "跟踪", "追踪",
-                 "express", "tracking", "inventory", "order", "ship"]
+TOOL_KEYWORDS = [
+    "快递",
+    "物流",
+    "单号",
+    "库存",
+    "查询",
+    "订单",
+    "跟踪",
+    "追踪",
+    "express",
+    "tracking",
+    "inventory",
+    "order",
+    "ship",
+]
 
 
 def needs_tools(message: str) -> bool:
@@ -52,9 +67,12 @@ def save_data_url_to_file(data_url: str) -> str | None:
         return None
 
 
-def call_openclaw_agent(message: str, session_id: str | None = None, agent_id: str = "main") -> str:
+def call_openclaw_agent(
+    message: str, session_id: str | None = None, agent_id: str = "main"
+) -> str:
     """Call openclaw agent CLI and return the response text."""
     import glob as _glob
+
     for lock in _glob.glob(f"/root/.openclaw/agents/{agent_id}/sessions/*.lock"):
         try:
             os.remove(lock)
@@ -81,8 +99,16 @@ def call_openclaw_agent(message: str, session_id: str | None = None, agent_id: s
                 continue
             try:
                 obj, end = decoder.raw_decode(output, idx)
-                if "payloads" in obj and isinstance(obj["payloads"], list) and obj["payloads"]:
-                    texts = [p["text"] for p in obj["payloads"] if isinstance(p, dict) and p.get("text")]
+                if (
+                    "payloads" in obj
+                    and isinstance(obj["payloads"], list)
+                    and obj["payloads"]
+                ):
+                    texts = [
+                        p["text"]
+                        for p in obj["payloads"]
+                        if isinstance(p, dict) and p.get("text")
+                    ]
                     if texts:
                         return "\n".join(texts)
                 idx = end
@@ -95,43 +121,72 @@ def call_openclaw_agent(message: str, session_id: str | None = None, agent_id: s
         return f"OpenClaw bridge error: {e}"
 
 
-def extract_message_info(messages: list) -> tuple[str, bool, list[str]]:
-    """Extract user message text, image presence, and image data URLs."""
+def extract_message_info(messages: list) -> tuple[str, bool, list[str], str]:
+    """Extract user message text, image presence, image data URLs, and prior context."""
     user_msg = ""
     has_images = False
     image_data_urls = []
+    prior_context_parts = []
 
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                text_parts = [p.get("text", "") for p in content if p.get("type") == "text"]
-                user_msg = " ".join(text_parts)
-                for p in content:
-                    if p.get("type") == "image_url":
-                        has_images = True
-                        url = p.get("image_url", {}).get("url", "")
-                        if url:
-                            image_data_urls.append(url)
-            else:
-                user_msg = content
-            break
+    # Collect all user messages in order
+    user_messages = [msg for msg in messages if msg.get("role") == "user"]
 
-    return user_msg, has_images, image_data_urls
+    if not user_messages:
+        return "", False, [], ""
+
+    # Process the LAST user message (the current one) for routing
+    last_msg = user_messages[-1]
+    content = last_msg.get("content", "")
+    if isinstance(content, list):
+        text_parts = [p.get("text", "") for p in content if p.get("type") == "text"]
+        user_msg = " ".join(text_parts)
+        for p in content:
+            if p.get("type") == "image_url":
+                has_images = True
+                url = p.get("image_url", {}).get("url", "")
+                if url:
+                    image_data_urls.append(url)
+    else:
+        user_msg = content
+
+    # Build prior context from ALL earlier user messages
+    has_prior_image = False
+    for msg in user_messages[:-1]:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for p in content:
+                if p.get("type") == "text":
+                    text = p.get("text", "").strip()
+                    if text:
+                        prior_context_parts.append(text)
+                elif p.get("type") == "image_url":
+                    has_prior_image = True
+        elif isinstance(content, str) and content.strip():
+            prior_context_parts.append(content.strip())
+
+    if has_prior_image:
+        prior_context_parts.append("[此前用户发送了图片]")
+
+    prior_context = "\n".join(prior_context_parts) if prior_context_parts else ""
+    return user_msg, has_images, image_data_urls, prior_context
 
 
 class OpenClawBridgeHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/v1/models":
-            self.send_json({
-                "object": "list",
-                "data": [{
-                    "id": "openclaw-agent",
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": "openclaw",
-                }]
-            })
+            self.send_json(
+                {
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "openclaw-agent",
+                            "object": "model",
+                            "created": int(time.time()),
+                            "owned_by": "openclaw",
+                        }
+                    ],
+                }
+            )
         elif self.path == "/health":
             self.send_json({"ok": True})
         else:
@@ -151,11 +206,19 @@ class OpenClawBridgeHandler(BaseHTTPRequestHandler):
             model = body.get("model", "openclaw-agent")
             stream = body.get("stream", False)
 
-            user_msg, has_images, image_data_urls = extract_message_info(messages)
+            user_msg, has_images, image_data_urls, prior_context = extract_message_info(
+                messages
+            )
 
             if not user_msg and not has_images:
                 self.send_error(400, "No user message found")
                 return
+
+            # Build agent message with prior context for text/tool routes
+            def _with_context(msg: str) -> str:
+                if prior_context:
+                    return f"[对话历史]\n{prior_context}\n[当前消息]\n{msg}"
+                return msg
 
             # Route by content type to specialized agents
             if has_images:
@@ -177,35 +240,57 @@ class OpenClawBridgeHandler(BaseHTTPRequestHandler):
                 agent_id = AGENT_IMAGE
             elif needs_tools(user_msg):
                 agent_id = AGENT_TOOL
-                agent_msg = user_msg
+                agent_msg = _with_context(user_msg)
             else:
                 agent_id = AGENT_TEXT
-                agent_msg = user_msg
+                agent_msg = _with_context(user_msg)
 
-            session_key = str(hash(json.dumps(messages[:3])))[:16]
-            session_id = SESSION_MAP.get(session_key)
-            print(f"[bridge] agent={agent_id} has_images={has_images} msg={user_msg[:80]!r}", flush=True)
+            # Use first user message as stable session key
+            first_user_msg = next(
+                (m for m in messages if m.get("role") == "user"), None
+            )
+            if first_user_msg:
+                session_key = str(hash(json.dumps(first_user_msg.get("content", ""))))[
+                    :16
+                ]
+            else:
+                session_key = str(hash(json.dumps(messages[:3])))[:16]
+            with SESSION_MAP_LOCK:
+                session_id = SESSION_MAP.get(session_key)
+            print(
+                f"[bridge] agent={agent_id} has_images={has_images} msg={user_msg[:80]!r}",
+                flush=True,
+            )
 
             reply = call_openclaw_agent(agent_msg, session_id, agent_id)
 
             if not session_id:
-                SESSION_MAP[session_key] = str(uuid.uuid4())[:8]
+                with SESSION_MAP_LOCK:
+                    SESSION_MAP[session_key] = str(uuid.uuid4())[:8]
 
             if stream:
                 self.send_stream_response(reply, model)
             else:
-                self.send_json({
-                    "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "message": {"role": "assistant", "content": reply},
-                        "finish_reason": "stop"
-                    }],
-                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-                })
+                self.send_json(
+                    {
+                        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": reply},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0,
+                            "total_tokens": 0,
+                        },
+                    }
+                )
         except Exception as e:
             self.send_error(500, str(e))
         finally:
@@ -225,7 +310,13 @@ class OpenClawBridgeHandler(BaseHTTPRequestHandler):
             "object": "chat.completion.chunk",
             "created": int(time.time()),
             "model": model,
-            "choices": [{"index": 0, "delta": {"role": "assistant", "content": reply}, "finish_reason": None}]
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": reply},
+                    "finish_reason": None,
+                }
+            ],
         }
         self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
         self.wfile.write(b"data: [DONE]\n\n")
@@ -256,9 +347,11 @@ class OpenClawBridgeHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    server = HTTPServer(("127.0.0.1", PORT), OpenClawBridgeHandler)
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), OpenClawBridgeHandler)
     print(f"OpenClaw bridge listening on http://127.0.0.1:{PORT}")
-    print(f"  text-agent={AGENT_TEXT}  image-agent={AGENT_IMAGE}  voice-agent={AGENT_VOICE}  tool-agent={AGENT_TOOL}")
+    print(
+        f"  text-agent={AGENT_TEXT}  image-agent={AGENT_IMAGE}  voice-agent={AGENT_VOICE}  tool-agent={AGENT_TOOL}"
+    )
     server.serve_forever()
 
 
