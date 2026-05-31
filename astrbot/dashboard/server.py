@@ -328,6 +328,7 @@ class AstrBotDashboard:
     def _get_required_open_api_scope(path: str) -> str | None:
         scope_map = {
             "/api/v1/chat": "chat",
+            "/api/v1/chat/sync": "chat",
             "/api/v1/chat/ws": "chat",
             "/api/v1/chat/sessions": "chat",
             "/api/v1/configs": "config",

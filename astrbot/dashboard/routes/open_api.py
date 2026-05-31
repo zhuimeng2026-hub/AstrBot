@@ -42,6 +42,7 @@ class OpenApiRoute(Route):
 
         self.routes = {
             "/v1/chat": ("POST", self.chat_send),
+            "/v1/chat/sync": ("POST", self.chat_send_sync),
             "/v1/chat/sessions": ("GET", self.get_chat_sessions),
             "/v1/configs": ("GET", self.get_chat_configs),
             "/v1/file": [
@@ -523,6 +524,132 @@ class OpenApiRoute(Route):
                 await self._handle_chat_ws_send(message)
         except Exception as e:
             logger.debug("Open API WS connection closed: %s", e)
+
+    async def chat_send_sync(self):
+        post_data = await request.get_json(silent=True) or {}
+
+        effective_username, username_err = self._resolve_open_username(
+            post_data.get("username")
+        )
+        if username_err:
+            return Response().error(username_err).__dict__
+        if not effective_username:
+            return Response().error("Invalid username").__dict__
+
+        message = post_data.get("message")
+        if not message or not str(message).strip():
+            return Response().error("Missing key: message").__dict__
+
+        raw_session_id = post_data.get("session_id", post_data.get("conversation_id"))
+        session_id = str(raw_session_id).strip() if raw_session_id is not None else ""
+        if not session_id:
+            session_id = str(uuid4())
+
+        ensure_session_err = await self._ensure_chat_session(
+            effective_username, session_id
+        )
+        if ensure_session_err:
+            return Response().error(ensure_session_err).__dict__
+
+        config_id, resolve_err = self._resolve_chat_config_id(post_data)
+        if resolve_err:
+            return Response().error(resolve_err).__dict__
+
+        config_err = await self._update_session_config_route(
+            username=effective_username,
+            session_id=session_id,
+            config_id=config_id,
+        )
+        if config_err:
+            return Response().error(config_err).__dict__
+
+        message_parts = await self.chat_route._build_user_message_parts(message)
+        if not webchat_message_parts_have_content(message_parts):
+            return Response().error("Message content is empty").__dict__
+
+        message_id = str(uuid4())
+        selected_provider = post_data.get("selected_provider")
+        selected_model = post_data.get("selected_model")
+
+        back_queue = webchat_queue_mgr.get_or_create_back_queue(
+            message_id, session_id
+        )
+        try:
+            chat_queue = webchat_queue_mgr.get_or_create_queue(session_id)
+            await chat_queue.put(
+                (
+                    effective_username,
+                    session_id,
+                    {
+                        "message": message_parts,
+                        "selected_provider": selected_provider,
+                        "selected_model": selected_model,
+                        "enable_streaming": False,
+                        "message_id": message_id,
+                    },
+                )
+            )
+
+            message_parts_for_storage = strip_message_parts_path_fields(message_parts)
+            await self.chat_route.platform_history_mgr.insert(
+                platform_id="webchat",
+                user_id=session_id,
+                content={"type": "user", "message": message_parts_for_storage},
+                sender_id=effective_username,
+                sender_name=effective_username,
+            )
+
+            accumulated_text = ""
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 120
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return Response().error("Request timed out").__dict__
+                try:
+                    result = await asyncio.wait_for(
+                        back_queue.get(), timeout=min(1, remaining)
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                if not result:
+                    continue
+                if (
+                    result.get("message_id")
+                    and result["message_id"] != message_id
+                ):
+                    continue
+                msg_type = result.get("type")
+                if msg_type == "plain":
+                    accumulated_text += result.get("data", "")
+                elif msg_type == "end":
+                    break
+
+            try:
+                message_parts_to_save = [
+                    {"type": "text", "text": accumulated_text}
+                ]
+                refs = self.chat_route._extract_web_search_refs(
+                    accumulated_text, message_parts_to_save
+                )
+            except Exception:
+                refs = {}
+            await self.chat_route._save_bot_message(
+                session_id, message_parts_to_save, {}, refs
+            )
+
+            return Response().ok(
+                data={
+                    "session_id": session_id,
+                    "message_id": message_id,
+                    "reply": accumulated_text,
+                }
+            ).__dict__
+        except Exception as e:
+            logger.exception(f"Open API sync chat failed: {e}", exc_info=True)
+            return Response().error(f"Failed to process message: {e}").__dict__
+        finally:
+            webchat_queue_mgr.remove_back_queue(message_id)
 
     async def openapi_upload_file(self):
         return await self.chat_route.post_file()
