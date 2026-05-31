@@ -620,6 +620,9 @@ class OpenApiRoute(Route):
                 ):
                     continue
                 msg_type = result.get("type")
+                chain_type = result.get("chain_type")
+                if chain_type in ("agent_stats", "tool_call", "tool_call_result"):
+                    continue
                 if msg_type == "plain":
                     accumulated_text += result.get("data", "")
                 elif msg_type == "end":
