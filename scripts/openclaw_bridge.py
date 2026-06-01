@@ -149,20 +149,25 @@ def extract_message_info(messages: list) -> tuple[str, bool, list[str], str]:
     else:
         user_msg = content
 
-    # Build prior context from ALL earlier user messages
+    # Build prior context from ALL earlier messages (user + assistant)
     has_prior_image = False
-    for msg in user_messages[:-1]:
+    for msg in messages[:-1]:
+        role = msg.get("role", "")
         content = msg.get("content", "")
-        if isinstance(content, list):
-            for p in content:
-                if p.get("type") == "text":
-                    text = p.get("text", "").strip()
-                    if text:
-                        prior_context_parts.append(text)
-                elif p.get("type") == "image_url":
-                    has_prior_image = True
-        elif isinstance(content, str) and content.strip():
-            prior_context_parts.append(content.strip())
+        if role == "assistant":
+            if isinstance(content, str) and content.strip():
+                prior_context_parts.append(f"[助手回复] {content.strip()}")
+        elif role == "user":
+            if isinstance(content, list):
+                for p in content:
+                    if p.get("type") == "text":
+                        text = p.get("text", "").strip()
+                        if text:
+                            prior_context_parts.append(text)
+                    elif p.get("type") == "image_url":
+                        has_prior_image = True
+            elif isinstance(content, str) and content.strip():
+                prior_context_parts.append(content.strip())
 
     if has_prior_image:
         prior_context_parts.append("[此前用户发送了图片]")
