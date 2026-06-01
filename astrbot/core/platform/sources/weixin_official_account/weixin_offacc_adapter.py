@@ -155,7 +155,17 @@ class WeixinOfficialAccountServer:
 
             # by pass passive reply logic and return active reply directly.
             if self.active_send_mode:
+                from_user = str(getattr(msg, "source", ""))
+                msg_id = str(cast(str | int, getattr(msg, "id", "")))
+                self.user_buffer[from_user] = {
+                    "msg_id": msg_id,
+                    "preview": self._preview(msg),
+                    "task": None,
+                    "cached_xml": [],
+                    "started_at": time.monotonic(),
+                }
                 result_xml = await self.callback(msg)
+                self.user_buffer.pop(from_user, None)
                 if not result_xml:
                     return "success"
                 if isinstance(result_xml, str):
