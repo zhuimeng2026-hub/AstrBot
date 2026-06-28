@@ -1,4 +1,5 @@
 from collections.abc import AsyncGenerator
+from time import time
 
 from astrbot.core import logger
 from astrbot.core.platform import AstrMessageEvent
@@ -42,6 +43,8 @@ class PipelineScheduler:
         """
         for i in range(from_stage, len(self.stages)):
             stage = self.stages[i]  # 获取当前要执行的阶段
+            stage_name = stage.__class__.__name__
+            t0 = time()
             # logger.debug(f"执行阶段 {stage.__class__.__name__}")
             coroutine = stage.process(
                 event,
@@ -74,6 +77,14 @@ class PipelineScheduler:
                 if event.is_stopped():
                     logger.debug(f"阶段 {stage.__class__.__name__} 已终止事件传播。")
                     break
+
+            elapsed = (time() - t0) * 1000
+            event.trace.record(
+                "pipeline_stage",
+                stage=stage_name,
+                elapsed_ms=round(elapsed, 1),
+            )
+            logger.debug(f"[perf] {stage_name}: {elapsed:.0f}ms")
 
     async def execute(self, event: AstrMessageEvent) -> None:
         """执行 pipeline

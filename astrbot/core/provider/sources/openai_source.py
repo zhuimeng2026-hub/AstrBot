@@ -9,6 +9,7 @@ import uuid
 from collections.abc import AsyncGenerator
 from io import BytesIO
 from pathlib import Path
+from time import time
 from typing import Any, Literal
 from urllib.parse import unquote, urlparse
 
@@ -594,10 +595,15 @@ class ProviderOpenAIOfficial(Provider):
 
         self._sanitize_assistant_messages(payloads)
 
+        t0 = time()
         completion = await self.client.chat.completions.create(
             **payloads,
             stream=False,
             extra_body=extra_body,
+        )
+        elapsed = (time() - t0) * 1000
+        logger.debug(
+            f"[perf] LLM API call (non-stream): {elapsed:.0f}ms model={payloads.get('model', '')}"
         )
 
         if not isinstance(completion, ChatCompletion):
@@ -646,6 +652,7 @@ class ProviderOpenAIOfficial(Provider):
 
         self._sanitize_assistant_messages(payloads)
 
+        t0 = time()
         stream = await self.client.chat.completions.create(
             **payloads,
             stream=True,
@@ -656,8 +663,15 @@ class ProviderOpenAIOfficial(Provider):
         llm_response = LLMResponse("assistant", is_chunk=True)
 
         state = ChatCompletionStreamState()
+        first_chunk = True
 
         async for chunk in stream:
+            if first_chunk:
+                elapsed = (time() - t0) * 1000
+                logger.debug(
+                    f"[perf] LLM API time_to_first_chunk (stream): {elapsed:.0f}ms model={payloads.get('model', '')}"
+                )
+                first_chunk = False
             choice = chunk.choices[0] if chunk.choices else None
             delta = choice.delta if choice else None
 
@@ -710,6 +724,10 @@ class ProviderOpenAIOfficial(Provider):
         try:
             final_completion = state.get_final_completion()
             llm_response = await self._parse_openai_completion(final_completion, tools)
+            elapsed = (time() - t0) * 1000
+            logger.debug(
+                f"[perf] LLM API call (stream total): {elapsed:.0f}ms model={payloads.get('model', '')}"
+            )
             yield llm_response
         except Exception as e:
             logger.error("get_final_completion error: " + str(e))
@@ -1410,7 +1428,9 @@ class ProviderOpenAIOfficial(Provider):
                 image_part = await self._resolve_image_part(image_url)
                 if image_part:
                     content_blocks.append(image_part)
-                    logger.info(f"[IMG] 图片已加入 content_blocks, url={image_url[:60]}")
+                    logger.info(
+                        f"[IMG] 图片已加入 content_blocks, url={image_url[:60]}"
+                    )
                 else:
                     logger.warning(f"[IMG] 图片解析失败, url={image_url[:60]}")
 

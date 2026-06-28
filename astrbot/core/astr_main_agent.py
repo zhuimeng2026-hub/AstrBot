@@ -10,6 +10,7 @@ import zoneinfo
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import time
 
 from astrbot.core import logger
 from astrbot.core.agent.handoff import HandoffTool
@@ -1224,6 +1225,133 @@ def _select_image_chat_provider(
     return provider
 
 
+async def _process_media_attachments(
+    event: AstrMessageEvent,
+    req: ProviderRequest,
+    config: MainAgentBuildConfig,
+) -> None:
+    """Process media file attachments (images, audio, files, video) from the message."""
+    for comp in event.message_obj.message:
+        if isinstance(comp, Image):
+            path = await comp.convert_to_file_path()
+            image_path = await _compress_image_for_provider(
+                path,
+                config.provider_settings,
+            )
+            if _is_generated_compressed_image_path(path, image_path):
+                event.track_temporary_local_file(image_path)
+            req.image_urls.append(image_path)
+            req.extra_user_content_parts.append(
+                TextPart(text=f"[Image Attachment: path {image_path}]")
+            )
+            logger.info(f"[IMG] 提取图片组件: path={image_path}")
+        elif isinstance(comp, Record):
+            audio_path = await comp.convert_to_file_path()
+            req.audio_urls.append(audio_path)
+            _append_audio_attachment(req, audio_path)
+        elif isinstance(comp, File):
+            file_path = await comp.get_file()
+            file_name = comp.name or os.path.basename(file_path)
+            req.extra_user_content_parts.append(
+                TextPart(text=f"[File Attachment: name {file_name}, path {file_path}]")
+            )
+        elif isinstance(comp, Video):
+            await _append_video_attachment(req, comp)
+
+
+async def _process_quote_attachments(
+    event: AstrMessageEvent,
+    req: ProviderRequest,
+    config: MainAgentBuildConfig,
+) -> None:
+    """Process quoted message attachments (images, audio, files, video)."""
+    reply_comps = [
+        comp for comp in event.message_obj.message if isinstance(comp, Reply)
+    ]
+    quoted_message_settings = _get_quoted_message_parser_settings(
+        config.provider_settings
+    )
+    fallback_quoted_image_count = 0
+    for comp in reply_comps:
+        has_embedded_image = False
+        if comp.chain:
+            for reply_comp in comp.chain:
+                if isinstance(reply_comp, Image):
+                    has_embedded_image = True
+                    path = await reply_comp.convert_to_file_path()
+                    image_path = await _compress_image_for_provider(
+                        path,
+                        config.provider_settings,
+                    )
+                    if _is_generated_compressed_image_path(path, image_path):
+                        event.track_temporary_local_file(image_path)
+                    req.image_urls.append(image_path)
+                    _append_quoted_image_attachment(req, image_path)
+                elif isinstance(reply_comp, Record):
+                    audio_path = await reply_comp.convert_to_file_path()
+                    req.audio_urls.append(audio_path)
+                    _append_quoted_audio_attachment(req, audio_path)
+                elif isinstance(reply_comp, File):
+                    file_path = await reply_comp.get_file()
+                    file_name = reply_comp.name or os.path.basename(file_path)
+                    req.extra_user_content_parts.append(
+                        TextPart(
+                            text=(
+                                f"[File Attachment in quoted message: "
+                                f"name {file_name}, path {file_path}]"
+                            )
+                        )
+                    )
+                elif isinstance(reply_comp, Video):
+                    await _append_video_attachment(req, reply_comp, quoted=True)
+
+        # Fallback quoted image extraction for reply-id-only payloads, or when
+        # embedded reply chain only contains placeholders (e.g. [Forward Message], [Image]).
+        if not has_embedded_image:
+            try:
+                fallback_images = normalize_and_dedupe_strings(
+                    await extract_quoted_message_images(
+                        event,
+                        comp,
+                        settings=quoted_message_settings,
+                    )
+                )
+                remaining_limit = max(
+                    config.max_quoted_fallback_images - fallback_quoted_image_count,
+                    0,
+                )
+                if remaining_limit <= 0 and fallback_images:
+                    logger.warning(
+                        "Skip quoted fallback images due to limit=%d for umo=%s",
+                        config.max_quoted_fallback_images,
+                        event.unified_msg_origin,
+                    )
+                    continue
+                if len(fallback_images) > remaining_limit:
+                    logger.warning(
+                        "Truncate quoted fallback images for umo=%s, reply_id=%s from %d to %d",
+                        event.unified_msg_origin,
+                        getattr(comp, "id", None),
+                        len(fallback_images),
+                        remaining_limit,
+                    )
+                    fallback_images = fallback_images[:remaining_limit]
+                for image_ref in fallback_images:
+                    if image_ref in req.image_urls:
+                        continue
+                    req.image_urls.append(image_ref)
+                    fallback_quoted_image_count += 1
+                    _append_quoted_image_attachment(req, image_ref)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to resolve fallback quoted images for umo=%s, reply_id=%s: %s",
+                    event.unified_msg_origin,
+                    getattr(comp, "id", None),
+                    exc,
+                    exc_info=True,
+                )
+
+
 async def build_main_agent(
     *,
     event: AstrMessageEvent,
@@ -1269,124 +1397,16 @@ async def build_main_agent(
 
             req.prompt = event.message_str[len(config.provider_wake_prefix) :]
 
-            # media files attachments
-            for comp in event.message_obj.message:
-                if isinstance(comp, Image):
-                    path = await comp.convert_to_file_path()
-                    image_path = await _compress_image_for_provider(
-                        path,
-                        config.provider_settings,
-                    )
-                    if _is_generated_compressed_image_path(path, image_path):
-                        event.track_temporary_local_file(image_path)
-                    req.image_urls.append(image_path)
-                    req.extra_user_content_parts.append(
-                        TextPart(text=f"[Image Attachment: path {image_path}]")
-                    )
-                    logger.info(f"[IMG] 提取图片组件: path={image_path}")
-                elif isinstance(comp, Record):
-                    audio_path = await comp.convert_to_file_path()
-                    req.audio_urls.append(audio_path)
-                    _append_audio_attachment(req, audio_path)
-                elif isinstance(comp, File):
-                    file_path = await comp.get_file()
-                    file_name = comp.name or os.path.basename(file_path)
-                    req.extra_user_content_parts.append(
-                        TextPart(
-                            text=f"[File Attachment: name {file_name}, path {file_path}]"
-                        )
-                    )
-                elif isinstance(comp, Video):
-                    await _append_video_attachment(req, comp)
-            # quoted message attachments
-            reply_comps = [
-                comp for comp in event.message_obj.message if isinstance(comp, Reply)
-            ]
-            quoted_message_settings = _get_quoted_message_parser_settings(
-                config.provider_settings
+            # Wave 1: parallel media/quote processing + DB conversation fetch
+            t0 = time()
+            _, _, conversation = await asyncio.gather(
+                _process_media_attachments(event, req, config),
+                _process_quote_attachments(event, req, config),
+                _get_session_conv(event, plugin_context),
             )
-            fallback_quoted_image_count = 0
-            for comp in reply_comps:
-                has_embedded_image = False
-                if comp.chain:
-                    for reply_comp in comp.chain:
-                        if isinstance(reply_comp, Image):
-                            has_embedded_image = True
-                            path = await reply_comp.convert_to_file_path()
-                            image_path = await _compress_image_for_provider(
-                                path,
-                                config.provider_settings,
-                            )
-                            if _is_generated_compressed_image_path(path, image_path):
-                                event.track_temporary_local_file(image_path)
-                            req.image_urls.append(image_path)
-                            _append_quoted_image_attachment(req, image_path)
-                        elif isinstance(reply_comp, Record):
-                            audio_path = await reply_comp.convert_to_file_path()
-                            req.audio_urls.append(audio_path)
-                            _append_quoted_audio_attachment(req, audio_path)
-                        elif isinstance(reply_comp, File):
-                            file_path = await reply_comp.get_file()
-                            file_name = reply_comp.name or os.path.basename(file_path)
-                            req.extra_user_content_parts.append(
-                                TextPart(
-                                    text=(
-                                        f"[File Attachment in quoted message: "
-                                        f"name {file_name}, path {file_path}]"
-                                    )
-                                )
-                            )
-                        elif isinstance(reply_comp, Video):
-                            await _append_video_attachment(req, reply_comp, quoted=True)
-
-                # Fallback quoted image extraction for reply-id-only payloads, or when
-                # embedded reply chain only contains placeholders (e.g. [Forward Message], [Image]).
-                if not has_embedded_image:
-                    try:
-                        fallback_images = normalize_and_dedupe_strings(
-                            await extract_quoted_message_images(
-                                event,
-                                comp,
-                                settings=quoted_message_settings,
-                            )
-                        )
-                        remaining_limit = max(
-                            config.max_quoted_fallback_images
-                            - fallback_quoted_image_count,
-                            0,
-                        )
-                        if remaining_limit <= 0 and fallback_images:
-                            logger.warning(
-                                "Skip quoted fallback images due to limit=%d for umo=%s",
-                                config.max_quoted_fallback_images,
-                                event.unified_msg_origin,
-                            )
-                            continue
-                        if len(fallback_images) > remaining_limit:
-                            logger.warning(
-                                "Truncate quoted fallback images for umo=%s, reply_id=%s from %d to %d",
-                                event.unified_msg_origin,
-                                getattr(comp, "id", None),
-                                len(fallback_images),
-                                remaining_limit,
-                            )
-                            fallback_images = fallback_images[:remaining_limit]
-                        for image_ref in fallback_images:
-                            if image_ref in req.image_urls:
-                                continue
-                            req.image_urls.append(image_ref)
-                            fallback_quoted_image_count += 1
-                            _append_quoted_image_attachment(req, image_ref)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "Failed to resolve fallback quoted images for umo=%s, reply_id=%s: %s",
-                            event.unified_msg_origin,
-                            getattr(comp, "id", None),
-                            exc,
-                            exc_info=True,
-                        )
-
-            conversation = await _get_session_conv(event, plugin_context)
+            logger.debug(
+                f"[perf] build_main_agent wave1 (media+quote+DB): {(time() - t0) * 1000:.0f}ms"
+            )
             req.conversation = conversation
             req.contexts = json.loads(conversation.history)
             event.set_extra("provider_request", req)
@@ -1407,11 +1427,46 @@ async def build_main_agent(
     req.image_urls = normalize_and_dedupe_strings(req.image_urls)
     req.audio_urls = normalize_and_dedupe_strings(req.audio_urls)
 
-    if config.file_extract_enabled:
-        try:
-            await _apply_file_extract(event, req, config)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Error occurred while applying file extract: %s", exc)
+    cfg = config.provider_settings or plugin_context.get_config(
+        umo=event.unified_msg_origin
+    ).get("provider_settings", {})
+    _apply_prompt_prefix(req, cfg)
+
+    img_cap_prov_id: str = cfg.get("default_image_caption_provider_id") or ""
+    quoted_message_settings = _get_quoted_message_parser_settings(cfg)
+
+    # Wave 2: parallel LLM-heavy and I/O operations
+    async def _run_file_extract() -> None:
+        if config.file_extract_enabled:
+            try:
+                await _apply_file_extract(event, req, config)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Error occurred while applying file extract: %s", exc)
+
+    t0 = time()
+    await asyncio.gather(
+        _ensure_persona_and_skills(req, cfg, plugin_context, event),
+        _process_quote_message(
+            event,
+            req,
+            img_cap_prov_id,
+            plugin_context,
+            quoted_message_settings,
+            config,
+        ),
+        _run_file_extract(),
+        _apply_kb(event, req, plugin_context, config),
+        _apply_web_search_tools(event, req, plugin_context),
+    )
+    logger.debug(
+        f"[perf] build_main_agent wave2 (persona+quote+file+kb+search): {(time() - t0) * 1000:.0f}ms"
+    )
+
+    tz = config.timezone
+    if tz is None:
+        tz = plugin_context.get_config().get("timezone")
+    _append_system_reminders(event, req, cfg, tz)
+    _apply_workspace_extra_prompt(event, req)
 
     if not req.prompt and not req.image_urls and not req.audio_urls:
         if not event.get_group_id() and req.extra_user_content_parts:
@@ -1419,15 +1474,10 @@ async def build_main_agent(
         else:
             return None
 
-    await _decorate_llm_request(event, req, plugin_context, config)
-
-    await _apply_kb(event, req, plugin_context, config)
-
     if not req.session_id:
         req.session_id = event.unified_msg_origin
 
     _plugin_tool_fix(event, req)
-    await _apply_web_search_tools(event, req, plugin_context)
 
     if config.llm_safety_mode:
         _apply_llm_safety_mode(config, req)
@@ -1464,6 +1514,14 @@ async def build_main_agent(
         if req.model:
             req.model = None
         fallback_providers = [p for p in fallback_providers if p is not provider]
+
+    # Run after provider selection since it clears image_urls
+    if req.conversation and img_cap_prov_id and req.image_urls:
+        t0 = time()
+        await _ensure_img_caption(event, req, cfg, plugin_context, img_cap_prov_id)
+        logger.debug(
+            f"[perf] build_main_agent img_caption: {(time() - t0) * 1000:.0f}ms"
+        )
 
     if provider.provider_config.get("max_context_tokens", 0) <= 0:
         model = provider.get_model()
@@ -1529,7 +1587,11 @@ async def build_main_agent(
     )
 
     if apply_reset:
+        t0 = time()
         await reset_coro
+        logger.debug(
+            f"[perf] build_main_agent agent_reset: {(time() - t0) * 1000:.0f}ms"
+        )
 
     return MainAgentBuildResult(
         agent_runner=agent_runner,

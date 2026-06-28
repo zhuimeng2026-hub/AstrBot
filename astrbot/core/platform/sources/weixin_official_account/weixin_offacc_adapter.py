@@ -10,7 +10,13 @@ from requests import Response
 from wechatpy import WeChatClient, create_reply, parse_message
 from wechatpy.crypto import WeChatCrypto
 from wechatpy.exceptions import InvalidSignatureException
-from wechatpy.messages import BaseMessage, ImageMessage, TextMessage, VoiceMessage
+from wechatpy.messages import (
+    BaseMessage,
+    ImageMessage,
+    MiniProgramPageMessage,
+    TextMessage,
+    VoiceMessage,
+)
 from wechatpy.utils import check_signature
 
 from astrbot.api.event import MessageChain
@@ -123,6 +129,8 @@ class WeixinOfficialAccountServer:
             return "图片"
         if isinstance(msg, VoiceMessage):
             return "语音"
+        if isinstance(msg, MiniProgramPageMessage):
+            return msg.title or "小程序消息"
         return getattr(msg, "type", "未知消息")
 
     async def handle_callback(self, request) -> str:
@@ -495,6 +503,24 @@ class WeixinOfficialAccountPlatformAdapter(Platform):
             abm.message_str = ""
             abm.self_id = str(msg.target)
             abm.message = [Record(file=path_wav, url=path_wav)]
+            abm.type = MessageType.FRIEND_MESSAGE
+            abm.sender = MessageMember(
+                cast(str, msg.source),
+                cast(str, msg.source),
+            )
+            abm.message_id = str(cast(str | int, msg.id))
+            abm.timestamp = cast(int, msg.time)
+            abm.session_id = abm.sender.user_id
+        elif isinstance(msg, MiniProgramPageMessage):
+            title = msg.title or "小程序消息"
+            page_path = msg.page_path or ""
+            app_id = msg.app_id or ""
+            logger.info(
+                f"收到小程序卡片消息: title={title} app_id={app_id} page_path={page_path}"
+            )
+            abm.message_str = f"[小程序] {title}"
+            abm.self_id = str(msg.target)
+            abm.message = [Plain(f"[小程序] {title}")]
             abm.type = MessageType.FRIEND_MESSAGE
             abm.sender = MessageMember(
                 cast(str, msg.source),
