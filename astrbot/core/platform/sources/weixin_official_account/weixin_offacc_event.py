@@ -34,30 +34,40 @@ class WeixinOfficialAccountPlatformEvent(AstrMessageEvent):
     ) -> None:
         pass
 
-    async def split_plain(self, plain: str, max_length: int = 1024) -> list[str]:
-        """将长文本分割成多个小文本, 每个小文本长度不超过 max_length 字符
+    async def split_plain(self, plain: str, max_bytes: int = 2048) -> list[str]:
+        """将长文本分割成多个小文本, 每个小文本的 UTF-8 字节数不超过 max_bytes
 
         Args:
             plain (str): 要分割的长文本
+            max_bytes (int): 每段最大字节数, 微信客服消息限制为 2048 字节
         Returns:
             list[str]: 分割后的文本列表
 
         """
-        if len(plain) <= max_length:
+        if len(plain.encode("utf-8")) <= max_bytes:
             return [plain]
+
+        def char_end_for_byte_limit(text: str, start: int) -> int:
+            """从 start 开始, 找到字节数不超过 max_bytes 的末尾字符索引"""
+            byte_count = 0
+            for i in range(start, len(text)):
+                byte_count += len(text[i].encode("utf-8"))
+                if byte_count > max_bytes:
+                    return i
+            return len(text)
+
         result = []
         start = 0
         while start < len(plain):
-            # 剩下的字符串长度<max_length时结束
-            if start + max_length >= len(plain):
+            end = char_end_for_byte_limit(plain, start)
+            if end >= len(plain):
                 result.append(plain[start:])
                 break
 
             # 向前搜索分割标点符号
-            end = min(start + max_length, len(plain))
             cut_position = end
             for i in range(end, start, -1):
-                if i < len(plain) and plain[i - 1] in [
+                if plain[i - 1] in [
                     "。",
                     "！",
                     "？",
@@ -70,10 +80,6 @@ class WeixinOfficialAccountPlatformEvent(AstrMessageEvent):
                 ]:
                     cut_position = i
                     break
-
-            # 没找到合适的位置分割, 直接切分
-            if cut_position == end and end < len(plain):
-                cut_position = end
 
             result.append(plain[start:cut_position])
             start = cut_position
